@@ -310,7 +310,7 @@ export default function TAFForecaster() {
   const [copied, setCopied] = useState(false);
   const [validationErrors, setValidationErrors] = useState([]);
 
-  // ── Fetch METAR from AWC (NOAA via CORS Proxy) ──────────────────────────
+  // ── Fetch METAR from AWC (NOAA via Multi-Proxy Fallback) ──────────────────
   const fetchMETAR = useCallback(async (icao) => {
     setMetarLoading(true);
     setMetarError(null);
@@ -319,21 +319,32 @@ export default function TAFForecaster() {
     setDataSource(null);
 
     const targetUrl = `https://aviationweather.gov/api/data/metar?ids=${icao}&format=json&hours=24`;
-    const awcUrl = `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`;
+    const urlsToTry = [
+      targetUrl,
+      `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`,
+      `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`,
+    ];
 
-    try {
-      const res = await fetch(awcUrl, {
-        headers: { "Accept": "application/json" },
-        signal: AbortSignal.timeout(10000),
-      });
+    let json = null;
+    let successSource = null;
 
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const json = await res.json();
-
-      if (!Array.isArray(json) || json.length === 0) {
-        throw new Error(`Tidak ada data METAR untuk ${icao} dalam 24 jam terakhir`);
+    for (const url of urlsToTry) {
+      try {
+        const res = await fetch(url, { signal: AbortSignal.timeout(6000) });
+        if (res.ok) {
+          const data = await res.json();
+          if (Array.isArray(data) && data.length > 0) {
+            json = data;
+            successSource = url === targetUrl ? "NOAA Direct" : "NOAA (Proxy)";
+            break;
+          }
+        }
+      } catch (e) {
+        // Lanjut ke proxy berikutnya
       }
+    }
 
+    if (json && Array.isArray(json) && json.length > 0) {
       const rawList = json
         .map(item => item.rawOb || item.rawObservation || item.metar || "")
         .filter(Boolean);
@@ -342,9 +353,8 @@ export default function TAFForecaster() {
       setMetarData(parsed);
       setMetarRaw(rawList);
       setLastFetch(new Date().toUTCString().slice(17,25));
-      setDataSource("NOAA AWC");
+      setDataSource(successSource);
 
-      // Auto-fill base period from latest METAR
       if (parsed.length > 0) {
         const latest = parsed[0];
         setPeriods(prev => prev.map((p,i) => i===0 ? {
@@ -355,9 +365,8 @@ export default function TAFForecaster() {
           cloud: latest.cloud !== "--" ? latest.cloud : p.cloud,
         } : p));
       }
-
-    } catch (err) {
-      setMetarError(`Gagal mengambil data METAR: ${err.message}. Menggunakan data simulasi fallback.`);
+    } else {
+      setMetarError(`Server NOAA/Proxy tidak merespons. Menggunakan data simulasi fallback.`);
       const fallback = [
         `METAR ${icao} 210000Z 09004KT 9999 FEW018 SCT080 28/25 Q1010`,
         `METAR ${icao} 202100Z 16008KT 9999 FEW018 SCT080 32/26 Q1009`,
