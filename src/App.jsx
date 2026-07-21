@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useMemo } from "react";
 
 // ─── Station Registry ─────────────────────────────────────────────────────────
 const STATIONS = [
@@ -15,6 +15,7 @@ function parseMetar(raw) {
   if (!raw || typeof raw !== "string") return null;
   const s = raw.trim();
   const timeMatch = s.match(/\b(\d{2})(\d{2})(\d{2})Z\b/);
+  const day  = timeMatch ? timeMatch[1] : null;
   const time = timeMatch ? `${timeMatch[2]}${timeMatch[3]}Z` : "--";
 
   const windMatch = s.match(/\b(\d{3}|VRB)(\d{2,3})(G(\d{2,3}))?KT\b/);
@@ -43,9 +44,10 @@ function parseMetar(raw) {
   while ((cm = cloudReg.exec(s)) !== null) {
     cloudParts.push(`${cm[1]}${cm[2]}${cm[3]||""}`);
   }
+  const hasCB   = cloudParts.some(c => c.includes("CB") || c.includes("TCU"));
   const cloudStr = cloudParts.join(" ") || (s.includes("CAVOK") ? "CAVOK" : "SKC");
 
-  // Flight category
+  // Flight category (approximation — meter thresholds, not the FAA statute-mile scale)
   const lowestBroken = cloudParts
     .filter(c => /^(BKN|OVC)/.test(c))
     .map(c => parseInt(c.replace(/\D/g, "")))
@@ -55,7 +57,7 @@ function parseMetar(raw) {
   else if (vis < 5000 || lowestBroken < 10) cat = "IFR";
   else if (vis < 8000 || lowestBroken < 30) cat = "MVFR";
 
-  return { raw: s, time, dir, speed, gust, windStr, vis, wx, cloudStr, cat };
+  return { raw: s, day, time, dir, speed, gust, windStr, vis, wx, cloudStr, hasCB, cat };
 }
 
 // ─── Wind Vector Mean (Meteorologically Correct) ─────────────────────────────
@@ -75,37 +77,58 @@ function vectorMeanWind(metarList) {
   return { dir, speed: spd };
 }
 
+// FIX: baseline harus mencerminkan kondisi PREVAILING, bukan kejadian ekstrem
+// terakhir. Laporan dengan CB/TS dikeluarkan dari kandidat baseline cloud —
+// kondisi itu tetap direpresentasikan lewat grup TEMPO/PROB, bukan header TAF.
 function calculateBaseline(metarList) {
   const { dir, speed } = vectorMeanWind(metarList);
   const dirStr = String(dir).padStart(3,"0");
   const spdStr = String(speed).padStart(2,"0");
 
-  // Median visibility (robust terhadap outlier fog sementara)
+  // Median visibility (robust terhadap outlier fog/TS sementara)
   const visList = metarList.slice(0,6).map(m=>m.vis).sort((a,b)=>a-b);
-  const medVis  = visList[Math.floor(visList.length/2)] ?? 9999;
+  const medVis  = visList.length ? visList[Math.floor(visList.length/2)] : 9999;
   const visStr  = medVis >= 9000 ? "9999" : String(medVis).padStart(4,"0");
 
-  // Cloud: gunakan laporan terbaru yang valid
-  const latestCloud = metarList.find(m => m.cloudStr && m.cloudStr !== "SKC")?.cloudStr || "FEW018 SCT080";
+  // Cloud baseline: laporan non-konvektif terbaru (mengecualikan CB/TCU)
+  const nonConvective = metarList.find(m => m.cloudStr && m.cloudStr !== "SKC" && !m.hasCB);
+  const anyRecent     = metarList.find(m => m.cloudStr && m.cloudStr !== "SKC");
+  const latestCloud   = nonConvective?.cloudStr || anyRecent?.cloudStr || "FEW018 SCT080";
 
   return {
     wind:  `${dirStr}${spdStr}KT`,
     vis:   visStr,
     cloud: latestCloud,
+    windSpeed: speed,
   };
 }
 
 // ─── Diurnal Convection Window (Kalimantan Tropical Pattern) ─────────────────
-// UTC+8 WITA:
-//  • Siang: 14-18 WITA → 06-10Z
-//  • Malam: 18-22 WITA → 10-14Z
-// Untuk TAF 24H: periode TS aktif ≈ 06Z-14Z
+// UTC+8 WITA:  Siang 14–22 WITA ≈ 06–14Z (heuristik klimatologi kasar, BUKAN
+// hasil deteksi dari data NWP yang di-fetch — lihat catatan di UI).
 function getConvectionWindow(validFromStr) {
   const day = validFromStr.substring(0, 2);  // "DD"
   return {
     start: `${day}06`,  // 06Z = 14.00 WITA
     end:   `${day}14`,  // 14Z = 22.00 WITA
   };
+}
+
+// FIX: bangun isi grup TEMPO/PROB dari data aktual (baseline + severity),
+// bukan string cuaca buruk yang hardcoded secara statis.
+function buildConvectiveGroup(level, pFinal, baseline) {
+  if (level === "NONE") return "";
+  // Skala tingkat keparahan sederhana berdasarkan P_FINAL — tetap heuristik,
+  // bukan hasil model, tapi setidaknya proporsional terhadap probabilitas.
+  const gustAdd   = level === "TEMPO" ? 10 : level === "PROB40" ? 8 : 6;
+  const baseSpeed = Math.max(baseline.windSpeed || 8, 8);
+  const gust      = baseSpeed + gustAdd;
+  const dirPart   = baseline.wind.slice(0,3);
+  const visConv   = level === "TEMPO" ? 3000 : level === "PROB40" ? 4000 : 5000;
+  const cloudConv = level === "TEMPO" ? "SCT015CB BKN070" : level === "PROB40" ? "SCT015CB" : "SCT018CB";
+  const windPart  = `${dirPart}${String(baseSpeed).padStart(2,"0")}G${String(gust).padStart(2,"0")}KT`;
+  const prefix    = level === "TEMPO" ? "TEMPO" : `${level} TEMPO`;
+  return { prefix, windPart, visConv, cloudConv };
 }
 
 // ─── Helpers UI ───────────────────────────────────────────────────────────────
@@ -157,12 +180,18 @@ function ProbBar({ ecmwf, gfs, final, label }) {
   );
 }
 
+// Validasi ringan untuk field DDHH / DDHHMM supaya header TAF tidak rusak diam-diam
+const isDDHH   = v => /^\d{4}$/.test(v);
+const isHHMM   = v => /^\d{4}$/.test(v);
+const isDD     = v => /^\d{2}$/.test(v) && parseInt(v) >= 1 && parseInt(v) <= 31;
+
 // ─── Main App ─────────────────────────────────────────────────────────────────
 export default function TAFForecaster() {
   const [station, setStation]           = useState("WALS");
   const [stationInput, setStationInput] = useState("WALS");
-  const [inputMode, setInputMode]       = useState("API");
+  const [inputMode, setInputMode]       = useState("UPLOAD");
   const [manualText, setManualText]     = useState("");
+  const [uploadedFileName, setUploadedFileName] = useState("");
   const [activeTab, setActiveTab]       = useState("nwp");
 
   const [issueDate, setIssueDate] = useState(() => String(new Date().getUTCDate()).padStart(2,"0"));
@@ -178,10 +207,12 @@ export default function TAFForecaster() {
   const [metarData,    setMetarData]    = useState([]);
   const [metarRaw,     setMetarRaw]     = useState([]);
   const [metarLoading, setMetarLoading] = useState(false);
-  const [metarSource,  setMetarSource]  = useState("–");
+  const [metarSource,  setMetarSource]  = useState("Belum ada data — silakan upload file METAR");
+  const [metarIsFallback, setMetarIsFallback] = useState(false);
   const [nwpRows,      setNwpRows]      = useState([]);
   const [nwpLoading,   setNwpLoading]   = useState(false);
   const [nwpSummary,   setNwpSummary]   = useState(null);
+  const [nwpIsFallback, setNwpIsFallback] = useState(false);
 
   // Output states
   const [tafOutput,  setTafOutput]  = useState("");
@@ -189,46 +220,98 @@ export default function TAFForecaster() {
   const [reasoning,  setReasoning]  = useState("");
   const [mlTrace,    setMlTrace]    = useState([]);
   const [copied,     setCopied]     = useState(false);
+  const [formError,  setFormError]  = useState("");
 
   const currentStn = STATIONS.find(s => s.icao === station) || STATIONS[0];
 
-  // ══ FIX #1: URL absolut ke AWC (bukan /api/metar) ════════════════════════
-  // FIX #2: AWC max public = 24h (bukan 72h yang tidak didukung)
-  const fetchMETAR = useCallback(async (icao) => {
-    setMetarLoading(true);
-    const AWC_URL = `https://aviationweather.gov/api/data/metar?ids=${icao}&format=json&hours=24`;
-    try {
-      const res = await fetch(AWC_URL, { signal: AbortSignal.timeout(8000) });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const json = await res.json();
-      if (!Array.isArray(json) || json.length === 0) throw new Error("Tidak ada data");
-      const rawList = json.map(i => i.rawOb || i.rawObservation || "").filter(Boolean);
-      setMetarRaw(rawList);
-      setMetarData(rawList.map(parseMetar).filter(Boolean));
-      setMetarSource("NOAA AWC Live");
-    } catch (err) {
-      // Fallback realistis untuk WALS
-      const fb = [
-        `METAR ${icao} ${issueDate}0600Z 15008KT 9999 FEW018 SCT080 31/25 Q1008`,
-        `METAR ${icao} ${issueDate}0300Z 12005KT 9999 FEW018 29/25 Q1010`,
-        `METAR ${icao} ${String(parseInt(issueDate)-1).padStart(2,"0")}1800Z 15010G18KT 5000 TSRA SCT018CB BKN080 30/25 Q1007`,
-        `METAR ${icao} ${String(parseInt(issueDate)-1).padStart(2,"0")}1200Z 13006KT 9999 SCT015 BKN060 31/26 Q1009`,
-        `METAR ${icao} ${String(parseInt(issueDate)-1).padStart(2,"0")}0600Z 09004KT 8000 BR FEW008 27/25 Q1011`,
-        `METAR ${icao} ${String(parseInt(issueDate)-2).padStart(2,"0")}1800Z 16012G20KT 5000 TSRA SCT018CB 29/25 Q1007`,
-      ];
-      setMetarRaw(fb);
-      setMetarData(fb.map(parseMetar).filter(Boolean));
-      setMetarSource(`Fallback Mock (${err.message})`);
-    }
-    setMetarLoading(false);
-  }, [issueDate]);
+  const validationError = useMemo(() => {
+    if (!isDD(issueDate)) return "Tanggal UTC harus 2 digit (01-31).";
+    if (!isHHMM(issueTime)) return "Jam penerbitan harus format HHMM (4 digit).";
+    if (!isDDHH(validFrom)) return "Valid-from harus format DDHH (4 digit).";
+    if (!isDDHH(validTo)) return "Valid-to harus format DDHH (4 digit).";
+    return "";
+  }, [issueDate, issueTime, validFrom, validTo]);
 
-  // ══ FIX #3: Dual-model Open-Meteo — 2 request terpisah (bukan multi-model 
-  //    dalam 1 URL yang menyebabkan field name ambiguous) ════════════════════
-  const fetchDualNWP = useCallback(async (stn) => {
+  // METAR sekarang diambil dari file yang diupload pengguna (bukan live API),
+  // supaya tidak lagi bergantung pada aviationweather.gov yang sering diblokir
+  // CORS di lingkungan browser/artifact dan diam-diam jatuh ke data sintetis.
+  // Format yang diterima: file teks (.txt/.csv/.log) berisi satu laporan METAR
+  // mentah per baris, mis. "METAR WALS 210600Z 15008KT 9999 FEW018 31/25 Q1008".
+  const processMetarText = useCallback((text, sourceLabel) => {
+    const lines = text
+      .split(/\r?\n/)
+      .map(l => l.trim())
+      .filter(Boolean);
+    const parsed = lines.map(parseMetar).filter(Boolean);
+
+    setMetarRaw(lines);
+    setMetarData(parsed);
+
+    if (lines.length === 0) {
+      setMetarSource("File kosong — tidak ada baris yang bisa dibaca");
+      setMetarIsFallback(true);
+    } else if (parsed.length === 0) {
+      setMetarSource(`${sourceLabel}: 0/${lines.length} baris berhasil diparse — cek format`);
+      setMetarIsFallback(true);
+    } else if (parsed.length < lines.length) {
+      setMetarSource(`${sourceLabel}: ${parsed.length}/${lines.length} baris berhasil diparse (sebagian gagal)`);
+      setMetarIsFallback(true);
+    } else {
+      setMetarSource(`${sourceLabel}: ${parsed.length} laporan`);
+      setMetarIsFallback(false);
+    }
+  }, []);
+
+  const handleFileUpload = useCallback((e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setMetarLoading(true);
+    setUploadedFileName(file.name);
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      processMetarText(String(ev.target.result || ""), `Upload (${file.name})`);
+      setMetarLoading(false);
+    };
+    reader.onerror = () => {
+      setMetarSource(`Gagal membaca file ${file.name}`);
+      setMetarIsFallback(true);
+      setMetarLoading(false);
+    };
+    reader.readAsText(file);
+    // reset input value supaya file yang sama bisa diupload ulang jika perlu
+    e.target.value = "";
+  }, [processMetarText]);
+
+  const handleDownloadSample = () => {
+    const sample = [
+      `METAR ${station} ${issueDate}0600Z 15008KT 9999 FEW018 SCT080 31/25 Q1008`,
+      `METAR ${station} ${issueDate}0300Z 12005KT 9999 FEW018 29/25 Q1010`,
+      `METAR ${station} ${String(Math.max(parseInt(issueDate)-1,1)).padStart(2,"0")}1800Z 15010G18KT 5000 TSRA SCT018CB BKN080 30/25 Q1007`,
+    ].join("\n");
+    const blob = new Blob([sample], { type: "text/plain" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "contoh_format_metar.txt";
+    a.click();
+  };
+
+  // Dual-model Open-Meteo — 2 request terpisah supaya field per-model tidak ambigu.
+  // FIX: filter jam target sekarang berbasis TANGGAL KALENDER target (bukan cuma
+  // jam-of-day), karena forecast_days=2 mengembalikan jam yang sama untuk dua
+  // hari berbeda — tanpa filter tanggal, data besok dan lusa bisa tercampur.
+  const fetchDualNWP = useCallback(async (stn, targetDD) => {
     setNwpLoading(true);
     const BASE = "https://api.open-meteo.com/v1/forecast";
     const COMMON = `latitude=${stn.lat}&longitude=${stn.lon}&hourly=precipitation_probability,wind_speed_10m,wind_direction_10m&wind_speed_unit=kn&forecast_days=2&timezone=UTC`;
+
+    // Tentukan tanggal kalender penuh (YYYY-MM-DD) yang berkorespondensi dengan
+    // digit hari (DD) dari validFrom, menangani kemungkinan lompat bulan.
+    const now = new Date();
+    let candidate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), parseInt(targetDD)));
+    if (candidate < now && (now.getUTCDate() - parseInt(targetDD) > 15)) {
+      candidate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, parseInt(targetDD)));
+    }
+    const targetISODate = candidate.toISOString().slice(0,10); // "YYYY-MM-DD"
 
     try {
       const [resE, resG] = await Promise.all([
@@ -242,11 +325,11 @@ export default function TAFForecaster() {
 
       const rows = [];
       let maxE = 0, maxG = 0;
-
-      // Ambil jam 06-18Z (window konveksi Kaltim) dari hari ini
       const targetHours = [6, 7, 8, 9, 10, 11, 12, 13, 14];
 
       dataE.hourly.time.forEach((t, i) => {
+        const dateStr = t.slice(0, 10);
+        if (dateStr !== targetISODate) return;           // ← FIX tanggal
         const hour = new Date(t + "Z").getUTCHours();
         if (!targetHours.includes(hour)) return;
 
@@ -259,11 +342,13 @@ export default function TAFForecaster() {
         const gap = Math.abs(pE - pG);
         const consistent = gap <= 15;
         const pFinal = consistent
-          ? Math.round((pE + pG) / 2)   // consensus average
-          : pE;                           // jika divergen → prioritas ECMWF (resolusi lebih tinggi)
+          ? Math.round((pE + pG) / 2)
+          : pE; // divergen → prioritas ECMWF (resolusi lebih tinggi)
 
         rows.push({ hour: `${String(hour).padStart(2,"0")}Z`, pE, pG, pFinal, consistent });
       });
+
+      if (rows.length === 0) throw new Error("Tidak ada jam target pada tanggal yang cocok");
 
       const overallGap = Math.abs(maxE - maxG);
       const consistent = overallGap <= 15;
@@ -273,11 +358,12 @@ export default function TAFForecaster() {
       setNwpSummary({
         maxE, maxG, consistent, pFinalMax,
         status: consistent
-          ? `KONSISTEN — Rata-rata konsensus P_NWP = ${pFinalMax}%`
-          : `DIVERGEN (gap ${overallGap}%) — Prioritas ECMWF, P_NWP = ${maxE}%`,
+          ? `KONSISTEN — Rata-rata konsensus P_NWP = ${pFinalMax}% (tgl target ${targetISODate})`
+          : `DIVERGEN (gap ${overallGap}%) — Prioritas ECMWF, P_NWP = ${maxE}% (tgl target ${targetISODate})`,
       });
+      setNwpIsFallback(false);
     } catch (err) {
-      // Fallback dari klimatologi historis Kalimantan (data long-term)
+      // Fallback klimatologi Kalimantan — nilai indikatif historis, BUKAN forecast hari ini
       const fallbackRows = [
         { hour:"06Z", pE:35, pG:30, pFinal:32, consistent:true },
         { hour:"08Z", pE:50, pG:48, pFinal:49, consistent:true },
@@ -286,24 +372,22 @@ export default function TAFForecaster() {
         { hour:"14Z", pE:40, pG:35, pFinal:38, consistent:true },
       ];
       setNwpRows(fallbackRows);
-      setNwpSummary({ maxE:60, maxG:62, consistent:true, pFinalMax:58, status:`Klimatologi Fallback (${err.message})` });
+      setNwpSummary({ maxE:60, maxG:62, consistent:true, pFinalMax:58, status:`Klimatologi fallback, bukan forecast live (${err.message})` });
+      setNwpIsFallback(true);
     }
     setNwpLoading(false);
   }, []);
 
   useEffect(() => {
-    if (inputMode === "API") {
-      fetchMETAR(station);
-      fetchDualNWP(currentStn);
-    }
-  }, [station, inputMode]);
+    // NWP (Open-Meteo) tetap auto-fetch berdasarkan stasiun — ini tidak
+    // bergantung pada bagaimana METAR dimasukkan (upload/manual).
+    fetchDualNWP(currentStn, validFrom.substring(0,2));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [station]);
 
   const handleProcessManual = () => {
-    const lines = manualText.split("\n").map(l=>l.trim()).filter(Boolean);
-    setMetarRaw(lines);
-    setMetarData(lines.map(parseMetar).filter(Boolean));
-    setMetarSource("MANUAL INPUT");
-    fetchDualNWP(currentStn);
+    processMetarText(manualText, "Tempel manual");
+    fetchDualNWP(currentStn, validFrom.substring(0,2));
   };
 
   const handleApplyStation = () => {
@@ -311,8 +395,15 @@ export default function TAFForecaster() {
     if (code.length === 4) setStation(code);
   };
 
-  // ══ GENERATE: Sliding Window Probabilistic Synthesis ════════════════════════
+  // ══ GENERATE: Rule-Based Heuristic Blend (bukan model ML terlatih) ═════════
+  // Nama "sliding window" / "cross-validation" / "Bayesian" pada versi sebelumnya
+  // menyesatkan: yang berjalan adalah pembagian data + heuristik if/else dengan
+  // konstanta tetap, dan rata-rata tertimbang (bukan posterior Bayesian).
+  // Label di bawah sekarang menyebutnya apa adanya.
   const generateTAF = () => {
+    if (validationError) { setFormError(validationError); return; }
+    if (metarLoading || nwpLoading) { setFormError("Tunggu data METAR/NWP selesai dimuat."); return; }
+    setFormError("");
     setGenerating(true);
     setTafOutput(""); setReasoning(""); setMlTrace([]);
 
@@ -320,101 +411,93 @@ export default function TAFForecaster() {
       try {
         const trace = [];
 
-        // ── FASE 1: Sliding Window Partitioning ──────────────────────────────
-        // Window H1 = 12 laporan terbaru (~12 jam terakhir) → Validation set
-        // Window H2 = laporan 12-24 → Training set
-        // Catatan: dengan AWC max 24H, H1/H2 adalah pembagian 1 hari
-        const H1 = metarData.slice(0, 12);   // 0-12 jam terakhir (validation)
-        const H2 = metarData.slice(12, 24);   // 12-24 jam terakhir (training)
+        // ── FASE 1: Partisi Data (heuristik, bukan cross-validation formal) ──
+        // H1 = 12 laporan terbaru dipakai untuk cek konsistensi; H2 = 12
+        // laporan sebelumnya dipakai untuk hitung frekuensi dasar. Ini adalah
+        // pembagian sederhana, bukan k-fold cross-validation.
+        const H1 = metarData.slice(0, 12);
+        const H2 = metarData.slice(12, 24);
 
         const tsH1 = H1.filter(m => m.wx.includes("TS")).length;
         const tsH2 = H2.filter(m => m.wx.includes("TS")).length;
 
-        trace.push(`• FASE 1 - Sliding Window: Validation H1 (TS=${tsH1}x), Training H2 (TS=${tsH2}x)`);
+        trace.push(`• FASE 1 - Partisi data: kelompok terbaru H1 (TS=${tsH1}x dari ${H1.length}), kelompok sebelumnya H2 (TS=${tsH2}x dari ${H2.length})`);
 
         // ── FASE 2: P_METAR — Frekuensi relatif dengan Laplace Smoothing ────
-        // Laplace smoothing (α=1) mencegah probabilitas 0% dari ketiadaan
-        // contoh tunggal (tidak bisa langsung disimpulkan TS tidak akan terjadi)
-        const α = 1;  // Laplace smoothing factor
-        const K = 2;  // Jumlah kelas (TS / Non-TS)
-        const pTrain = (tsH2 + α) / (H2.length + α * K);  // P(TS|H2) smoothed
+        const α = 1;
+        const K = 2;
+        const pTrain = H2.length > 0 ? (tsH2 + α) / (H2.length + α * K) : 0.5;
 
-        // Cross-validation: bandingkan prediksi H2 vs aktual H1
         let pMetar = pTrain;
         let driftLabel = "";
         if (pTrain > 0.30 && tsH1 === 0) {
-          pMetar = pTrain * 0.45;  // Concept drift: siklus TS sudah lewat
-          driftLabel = "Concept Drift Terdeteksi (TS H2 tidak berulang di H1)";
+          pMetar = pTrain * 0.45;
+          driftLabel = "Pola TS di kelompok lama tidak berulang di kelompok baru → probabilitas diturunkan (aturan tetap, bukan hasil pembelajaran)";
         } else if (pTrain > 0.10 && tsH1 > 0) {
-          pMetar = Math.min(pTrain * 1.35, 0.95);  // Pola tervalidasi
-          driftLabel = "Pola TS Tervalidasi di H1 → Confidence Tinggi";
+          pMetar = Math.min(pTrain * 1.35, 0.95);
+          driftLabel = "Pola TS konsisten di kedua kelompok → probabilitas dinaikkan (aturan tetap)";
         } else if (pTrain < 0.10 && tsH1 > 0) {
-          pMetar = 0.40;  // Onset baru terdeteksi di H1
-          driftLabel = "Onset Konveksi Baru di H1 (tidak ada di H2)";
+          pMetar = 0.40;
+          driftLabel = "TS baru muncul di kelompok terbaru, tanpa riwayat sebelumnya → nilai tetap 40%";
         } else {
           driftLabel = "Tidak ada riwayat konveksi signifikan";
         }
         const pMetarPct = Math.round(pMetar * 100);
-        trace.push(`• FASE 2 - P_METAR: Laplace P(TS|H2)=${Math.round(pTrain*100)}% → setelah cross-val: ${pMetarPct}% [${driftLabel}]`);
+        trace.push(`• FASE 2 - P_METAR (heuristik): Laplace P(TS|H2)=${Math.round(pTrain*100)}% → setelah aturan penyesuaian: ${pMetarPct}% [${driftLabel}]`);
 
         // ── FASE 3: P_NWP dari dual model ────────────────────────────────────
+        // Catatan domain: precipitation_probability adalah peluang hujan umum
+        // dari Open-Meteo, BUKAN peluang thunderstorm/CB secara spesifik — ini
+        // proxy kasar, bukan pengukuran langsung probabilitas TS.
         const pNWP = nwpSummary?.pFinalMax ?? 40;
-        trace.push(`• FASE 3 - P_NWP: ${pNWP}% (${nwpSummary?.status || "data tidak tersedia"})`);
+        trace.push(`• FASE 3 - P_NWP (proxy peluang hujan, bukan peluang TS langsung): ${pNWP}% (${nwpSummary?.status || "data tidak tersedia"})`);
 
-        // ── FASE 4: Bayesian Blending ─────────────────────────────────────────
-        // Bobot: NWP lebih handal untuk 24H ke depan, METAR bagus untuk klimatologi lokal
-        // Bobot diambil dari literatur (Glahn & Lowry, 1972; Hamill 2004):
-        //   w_NWP = 0.60 (dominan untuk prakiraan 6-24 jam ke depan)
-        //   w_METAR = 0.40 (kontribusi pola klimatologi diurnal lokal)
+        // ── FASE 4: Rata-rata Tertimbang (bukan Bayesian) ────────────────────
+        // Ini adalah weighted average sederhana, bukan pembaruan Bayesian
+        // (tidak ada prior/likelihood/posterior). Bobot 60/40 dipilih sebagai
+        // heuristik operasional, bukan hasil kalibrasi statistik formal.
         const W_NWP   = 0.60;
         const W_METAR = 0.40;
         const pFinal  = Math.round(W_NWP * pNWP + W_METAR * pMetarPct);
-        trace.push(`• FASE 4 - Bayesian Blending: (${W_NWP}×${pNWP} + ${W_METAR}×${pMetarPct}) = P_FINAL ${pFinal}%`);
+        trace.push(`• FASE 4 - Rata-rata tertimbang: (${W_NWP}×${pNWP} + ${W_METAR}×${pMetarPct}) = P_FINAL ${pFinal}%`);
 
         // ── FASE 5: ICAO Decision Rule ────────────────────────────────────────
-        //   p ≥ 50% → TEMPO (pasti, durasi ≥30 mnt atau berulang)
-        //   40-49% → PROB40 TEMPO
-        //   30-39% → PROB30 TEMPO (FIX #4: harus PROB30 TEMPO bukan PROB30 sendiri)
-        //   < 30%  → tidak dicantumkan
         const convWindow = getConvectionWindow(validFrom);
-        let changeGroup = "";
-        let icaoRule = "";
-        if (pFinal >= 50) {
-          changeGroup = `TEMPO ${convWindow.start}/${convWindow.end} 15012G22KT 4000 TSRA SCT015CB BKN070`;
-          icaoRule = `P_FINAL=${pFinal}% ≥ 50% → TEMPO`;
-        } else if (pFinal >= 40) {
-          changeGroup = `PROB40 TEMPO ${convWindow.start}/${convWindow.end} 15010G18KT 5000 TSRA SCT015CB`;
-          icaoRule = `P_FINAL=${pFinal}% 40-49% → PROB40 TEMPO`;
-        } else if (pFinal >= 30) {
-          // FIX #4: PROB30 TEMPO (bukan PROB30 saja)
-          changeGroup = `PROB30 TEMPO ${convWindow.start}/${convWindow.end} 5000 TSRA SCT018CB`;
-          icaoRule = `P_FINAL=${pFinal}% 30-39% → PROB30 TEMPO`;
-        } else {
-          icaoRule = `P_FINAL=${pFinal}% < 30% → Tidak ada grup perubahan konveksi`;
-        }
-        trace.push(`• FASE 5 - ICAO Rule: ${icaoRule}`);
-
-        // ── FASE 6: Bangun string TAF ──────────────────────────────────────────
         const baseline = calculateBaseline(metarData);
-        const header   = `TAF ${station} ${issueDate}${issueTime}Z ${validFrom}/${validTo}`;
-        const lines    = [];
-        lines.push(`${header} ${baseline.wind} ${baseline.vis} ${baseline.cloud}`);
-        if (changeGroup) {
-          lines.push(`     ${changeGroup}`);
+        let level = "NONE";
+        let icaoRule = "";
+        if (pFinal >= 50)      { level = "TEMPO";  icaoRule = `P_FINAL=${pFinal}% ≥ 50% → TEMPO`; }
+        else if (pFinal >= 40) { level = "PROB40";  icaoRule = `P_FINAL=${pFinal}% 40-49% → PROB40 TEMPO`; }
+        else if (pFinal >= 30) { level = "PROB30";  icaoRule = `P_FINAL=${pFinal}% 30-39% → PROB30 TEMPO`; }
+        else                    { icaoRule = `P_FINAL=${pFinal}% < 30% → Tidak ada grup perubahan konveksi`; }
+        trace.push(`• FASE 5 - Aturan ICAO: ${icaoRule}`);
+
+        const conv = buildConvectiveGroup(level, pFinal, baseline);
+        if (conv) {
+          trace.push(`• FASE 6 - Grup dibangun dari baseline aktual: angin ${conv.windPart}, vis ${conv.visConv}M, awan ${conv.cloudConv}`);
         }
-        // BECMG akhir validitas: recovery pagi hari (angin lemah, cerah)
+
+        // ── FASE 7: Bangun string TAF ──────────────────────────────────────────
+        const header = `TAF ${station} ${issueDate}${issueTime}Z ${validFrom}/${validTo}`;
+        const lines  = [];
+        lines.push(`${header} ${baseline.wind} ${baseline.vis} ${baseline.cloud}`);
+        if (conv) {
+          lines.push(`     ${conv.prefix} ${convWindow.start}/${convWindow.end} ${conv.windPart} ${conv.visConv} TSRA ${conv.cloudConv}`);
+        }
         lines.push(`     BECMG ${validTo.substring(0,2)}04/${validTo.substring(0,2)}06 09006KT 9999 FEW018`);
 
-        // FIX #5: Tanda "=" HANYA di akhir seluruh TAF (bukan per grup)
-        const tafStr = lines.join("\n") + "=";
+        const tafStr = lines.join("\n") + "=";  // tanda "=" hanya sekali, di akhir seluruh TAF
 
         setTafOutput(tafStr);
         setMlTrace(trace);
         setReasoning(
-          `Sintesis TAF 24H — ${station}\n` +
+          `Sintesis TAF 24H (heuristik rule-based) — ${station}\n` +
           trace.join("\n") + "\n\n" +
           `KEPUTUSAN AKHIR: P_FINAL=${pFinal}% → "${icaoRule}"\n` +
-          `Window Konveksi Kaltim: ${convWindow.start}–${convWindow.end}Z (${parseInt(convWindow.start.slice(2))+8}:00–${parseInt(convWindow.end.slice(2))+8}:00 WITA)`
+          `Window konveksi Kaltim (klimatologi kasar, bukan dari deteksi NWP jam-per-jam): ${convWindow.start}–${convWindow.end}Z\n` +
+          (metarData.length === 0 ? `⚠ PERHATIAN: belum ada METAR yang diupload — baseline TAF memakai nilai default netral, bukan observasi aktual.\n` : "") +
+          (metarIsFallback ? `⚠ PERHATIAN: sebagian/semua baris METAR gagal diparse — periksa kembali format file yang diupload.\n` : "") +
+          (nwpIsFallback ? `⚠ PERHATIAN: NWP memakai klimatologi fallback, bukan forecast live.` : "")
         );
       } catch (e) {
         setTafOutput(`ERROR: ${e.message}`);
@@ -435,6 +518,8 @@ export default function TAFForecaster() {
     { id:"raw",   label:"Raw METAR",              icon:"📄" },
   ];
 
+  const anyFallback = metarIsFallback || nwpIsFallback;
+
   // ─── Render ────────────────────────────────────────────────────────────────
   return (
     <div style={{fontFamily:"'Inter','Segoe UI',sans-serif", background:"#060D16", minHeight:"100vh", color:"#CBD5E1"}}>
@@ -448,18 +533,22 @@ export default function TAFForecaster() {
 
       {/* ── Header ── */}
       <div style={{background:"linear-gradient(135deg,#080F1A,#0B1929)", borderBottom:"1px solid #1E3A5F", padding:"10px 20px"}}>
-        <div style={{maxWidth:"1440px", margin:"0 auto", display:"flex", alignItems:"center", justifyContent:"space-between"}}>
+        <div style={{maxWidth:"1440px", margin:"0 auto", display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:"8px"}}>
           <div style={{display:"flex", gap:"12px", alignItems:"center"}}>
             <div style={{width:"34px",height:"34px",borderRadius:"7px",background:"linear-gradient(135deg,#1E90FF,#0055CC)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:"17px",boxShadow:"0 0 10px #1E90FF30"}}>✈</div>
             <div>
-              <div style={{fontSize:"13px",fontWeight:"700",color:"#F1F5F9",letterSpacing:"0.04em"}}>TAF AUTO-FORECASTER AI</div>
-              <div style={{fontSize:"9px",color:"#475569",fontFamily:"monospace",letterSpacing:"0.1em"}}>SLIDING WINDOW · DUAL-MODEL SYNTHESIS · ICAO ANNEX 3 · 24H TAF</div>
+              <div style={{fontSize:"13px",fontWeight:"700",color:"#F1F5F9",letterSpacing:"0.04em"}}>TAF AUTO-FORECASTER (RULE-BASED)</div>
+              <div style={{fontSize:"9px",color:"#475569",fontFamily:"monospace",letterSpacing:"0.1em"}}>METAR VIA UPLOAD · NWP LIVE (OPEN-METEO) · ICAO ANNEX 3 · 24H TAF · BUKAN MODEL ML TERLATIH</div>
             </div>
           </div>
-          <div style={{display:"flex",gap:"8px",alignItems:"center"}}>
-            {metarSource && (
-              <span style={{fontSize:"9px",fontFamily:"monospace",color:"#22C55E",background:"#14532D30",padding:"3px 8px",borderRadius:"4px",border:"1px solid #166534"}}>
-                {metarSource}
+          <div style={{display:"flex",gap:"8px",alignItems:"center",flexWrap:"wrap"}}>
+            {metarData.length === 0 ? (
+              <span style={{fontSize:"9px",fontFamily:"monospace",color:"#64748B",background:"#0A192930",padding:"3px 8px",borderRadius:"4px",border:"1px solid #1E3A5F"}}>
+                ○ {metarSource}
+              </span>
+            ) : (
+              <span style={{fontSize:"9px",fontFamily:"monospace",color:metarIsFallback?"#FCD34D":"#22C55E",background:metarIsFallback?"#4A3A0030":"#14532D30",padding:"3px 8px",borderRadius:"4px",border:`1px solid ${metarIsFallback?"#92400E":"#166534"}`}}>
+                {metarIsFallback ? "⚠ " : "● "}{metarSource}
               </span>
             )}
             <span style={{fontSize:"9px",fontFamily:"monospace",color:"#475569",background:"#0A1929",padding:"3px 8px",borderRadius:"4px",border:"1px solid #1E3A5F"}}>
@@ -467,6 +556,11 @@ export default function TAFForecaster() {
             </span>
           </div>
         </div>
+        {anyFallback && (
+          <div style={{maxWidth:"1440px",margin:"8px auto 0",background:"#4A3A0030",border:"1px solid #92400E",borderRadius:"6px",padding:"6px 10px",fontSize:"9.5px",color:"#FCD34D",fontFamily:"monospace"}}>
+            ⚠ Sebagian data memakai fallback/sintetis (bukan observasi atau forecast live) — jangan pakai untuk keputusan operasional tanpa verifikasi manual.
+          </div>
+        )}
       </div>
 
       <div style={{maxWidth:"1440px",margin:"0 auto",padding:"14px 20px",display:"grid",gridTemplateColumns:"330px 1fr 360px",gap:"14px"}}>
@@ -497,25 +591,28 @@ export default function TAFForecaster() {
               </div>
             </div>
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:"6px",marginBottom:"8px"}}>
-              {[["TGL UTC",issueDate,setIssueDate],["ISSUE TIME",issueTime,setIssueTime]].map(([lbl,val,set])=>(
+              {[["TGL UTC",issueDate,setIssueDate,isDD(issueDate)],["ISSUE TIME",issueTime,setIssueTime,isHHMM(issueTime)]].map(([lbl,val,set,valid])=>(
                 <div key={lbl}>
                   <div style={{fontSize:"9px",color:"#475569",marginBottom:"3px"}}>{lbl}</div>
                   <input value={val} onChange={e=>set(e.target.value)}
-                    style={{width:"100%",background:"#080F1A",border:"1px solid #1E3A5F",borderRadius:"4px",padding:"5px 7px",fontSize:"10px",fontFamily:"monospace",color:"#94A3B8",outline:"none"}}
+                    style={{width:"100%",background:"#080F1A",border:`1px solid ${valid?"#1E3A5F":"#B91C1C"}`,borderRadius:"4px",padding:"5px 7px",fontSize:"10px",fontFamily:"monospace",color:"#94A3B8",outline:"none"}}
                   />
                 </div>
               ))}
               <div>
                 <div style={{fontSize:"9px",color:"#475569",marginBottom:"3px"}}>VALID 24H</div>
                 <div style={{display:"flex",gap:"2px",alignItems:"center"}}>
-                  <input value={validFrom} onChange={e=>setValidFrom(e.target.value)} style={{width:"45%",background:"#080F1A",border:"1px solid #1E3A5F",borderRadius:"4px",padding:"5px 4px",fontSize:"9px",fontFamily:"monospace",color:"#94A3B8",outline:"none",textAlign:"center"}}/>
+                  <input value={validFrom} onChange={e=>setValidFrom(e.target.value)} style={{width:"45%",background:"#080F1A",border:`1px solid ${isDDHH(validFrom)?"#1E3A5F":"#B91C1C"}`,borderRadius:"4px",padding:"5px 4px",fontSize:"9px",fontFamily:"monospace",color:"#94A3B8",outline:"none",textAlign:"center"}}/>
                   <span style={{color:"#334155",fontSize:"9px"}}>/</span>
-                  <input value={validTo} onChange={e=>setValidTo(e.target.value)} style={{width:"45%",background:"#080F1A",border:"1px solid #1E3A5F",borderRadius:"4px",padding:"5px 4px",fontSize:"9px",fontFamily:"monospace",color:"#94A3B8",outline:"none",textAlign:"center"}}/>
+                  <input value={validTo} onChange={e=>setValidTo(e.target.value)} style={{width:"45%",background:"#080F1A",border:`1px solid ${isDDHH(validTo)?"#1E3A5F":"#B91C1C"}`,borderRadius:"4px",padding:"5px 4px",fontSize:"9px",fontFamily:"monospace",color:"#94A3B8",outline:"none",textAlign:"center"}}/>
                 </div>
               </div>
             </div>
+            {validationError && (
+              <div style={{fontSize:"8.5px",color:"#FCA5A5",fontFamily:"monospace",marginBottom:"8px"}}>⚠ {validationError}</div>
+            )}
             <div style={{display:"flex",gap:"5px"}}>
-              {[["API","📡 Auto API (AWC)"],["MANUAL","📝 Paste Manual"]].map(([m,lbl])=>(
+              {[["UPLOAD","📁 Upload File"],["MANUAL","📝 Paste Manual"]].map(([m,lbl])=>(
                 <button key={m} onClick={()=>setInputMode(m)} style={{flex:1,padding:"5px",fontSize:"9px",background:inputMode===m?"#1E3A8A":"#080F1A",color:inputMode===m?"#93C5FD":"#475569",border:"1px solid #1E3A5F",borderRadius:"4px",cursor:"pointer"}}>{lbl}</button>
               ))}
             </div>
@@ -535,7 +632,7 @@ export default function TAFForecaster() {
               {activeTab==="nwp" && (
                 <div>
                   <div style={{fontSize:"9px",fontFamily:"monospace",color:"#475569",marginBottom:"6px"}}>
-                    Prob Konvektif per jam · Window Kaltim 06-14Z (14-22 WITA)
+                    Peluang hujan per jam (proxy, bukan peluang TS langsung) · Window Kaltim 06-14Z (14-22 WITA)
                   </div>
                   {nwpLoading
                     ? <div style={{fontSize:"9px",color:"#22C55E",textAlign:"center",padding:"10px"}}>⟳ Fetching ECMWF & GFS...</div>
@@ -546,9 +643,9 @@ export default function TAFForecaster() {
                         ))
                   }
                   {nwpSummary && (
-                    <div style={{marginTop:"8px",background:"#080F1A",borderRadius:"5px",padding:"7px 9px",border:`1px solid ${nwpSummary.consistent?"#16653460":"#92400E60"}`}}>
-                      <div style={{fontSize:"9px",fontFamily:"monospace",color:nwpSummary.consistent?"#22C55E":"#FCD34D",fontWeight:"700"}}>
-                        KONSENSUS MODEL: {nwpSummary.status}
+                    <div style={{marginTop:"8px",background:"#080F1A",borderRadius:"5px",padding:"7px 9px",border:`1px solid ${nwpIsFallback?"#92400E60":(nwpSummary.consistent?"#16653460":"#92400E60")}`}}>
+                      <div style={{fontSize:"9px",fontFamily:"monospace",color:nwpIsFallback?"#FCD34D":(nwpSummary.consistent?"#22C55E":"#FCD34D"),fontWeight:"700"}}>
+                        {nwpIsFallback ? "⚠ FALLBACK: " : "KONSENSUS MODEL: "}{nwpSummary.status}
                       </div>
                     </div>
                   )}
@@ -558,7 +655,7 @@ export default function TAFForecaster() {
               {activeTab==="metar" && (
                 <div>
                   <div style={{fontSize:"9px",fontFamily:"monospace",color:"#475569",marginBottom:"5px"}}>
-                    {metarLoading ? "⟳ Fetching..." : `${metarData.length} laporan · ${metarSource}`}
+                    {metarLoading ? "⟳ Membaca file..." : `${metarData.length} laporan · ${metarSource}`}
                   </div>
                   {metarData.map((r,i)=>(
                     <div key={i} style={{fontSize:"9px",fontFamily:"monospace",padding:"4px 0",borderBottom:"1px solid #0F2235",display:"grid",gridTemplateColumns:"52px 90px 48px 56px 1fr 40px",gap:"4px",alignItems:"center"}}>
@@ -590,27 +687,49 @@ export default function TAFForecaster() {
         {/* ══ COL 2: Engine ══ */}
         <div style={{display:"flex",flexDirection:"column",gap:"10px"}}>
 
+          {inputMode==="UPLOAD" && (
+            <div style={{background:"#0D1E30",border:"1px solid #1E3A5F",borderRadius:"10px",padding:"12px"}}>
+              <div style={{fontSize:"10px",color:"#7DD3FC",fontWeight:"700",marginBottom:"6px"}}>📁 UPLOAD FILE METAR</div>
+              <div style={{fontSize:"8.5px",color:"#64748B",lineHeight:"1.5",marginBottom:"8px"}}>
+                File teks (.txt/.csv/.log), satu laporan METAR mentah per baris. Baris yang tidak cocok pola METAR akan diabaikan otomatis.
+              </div>
+              <label style={{display:"block",background:"#080F1A",border:"1px dashed #1E3A5F",borderRadius:"6px",padding:"16px",textAlign:"center",cursor:"pointer"}}>
+                <input type="file" accept=".txt,.csv,.log,text/plain" onChange={handleFileUpload} style={{display:"none"}} />
+                <div style={{fontSize:"10px",color:"#7DD3FC"}}>⬆ Klik untuk pilih file</div>
+                <div style={{fontSize:"8.5px",color:"#475569",marginTop:"3px"}}>{uploadedFileName || "Belum ada file dipilih"}</div>
+              </label>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:"8px"}}>
+                <span style={{fontSize:"8.5px",color:"#475569",fontFamily:"monospace"}}>
+                  {metarLoading ? "⟳ Membaca file..." : metarData.length > 0 ? `${metarData.length} laporan terbaca` : "Menunggu file"}
+                </span>
+                <button onClick={handleDownloadSample} style={{background:"transparent",border:"1px solid #1E3A5F",color:"#475569",borderRadius:"4px",padding:"4px 8px",fontSize:"8.5px",cursor:"pointer"}}>
+                  📄 Unduh contoh format
+                </button>
+              </div>
+            </div>
+          )}
+
           {inputMode==="MANUAL" && (
             <div style={{background:"#0D1E30",border:"1px solid #1E3A5F",borderRadius:"10px",padding:"12px"}}>
-              <div style={{fontSize:"10px",color:"#7DD3FC",fontWeight:"700",marginBottom:"6px"}}>📝 PASTE METAR MANUAL</div>
+              <div style={{fontSize:"10px",color:"#7DD3FC",fontWeight:"700",marginBottom:"6px"}}>📝 TEMPEL METAR MANUAL</div>
               <textarea rows={5} value={manualText} onChange={e=>setManualText(e.target.value)} placeholder={"METAR WALS 210600Z 15008KT 9999 FEW018 SCT080 31/25 Q1008\n..."}
                 style={{width:"100%",background:"#080F1A",border:"1px solid #1E3A5F",color:"#22C55E",fontSize:"9.5px",fontFamily:"monospace",padding:"8px",outline:"none",borderRadius:"4px",resize:"vertical"}}
               />
               <button onClick={handleProcessManual} style={{marginTop:"6px",background:"#1E3A8A",border:"1px solid #2563EB",color:"#93C5FD",borderRadius:"4px",padding:"5px 12px",fontSize:"9px",cursor:"pointer"}}>
-                ▶ Proses & Fetch NWP
+                ▶ Proses Data
               </button>
             </div>
           )}
 
-          {/* ML Engine Explainer */}
+          {/* Engine Explainer */}
           <div style={{background:"#0D1E30",border:"1px solid #1E3A5F",borderRadius:"10px",padding:"14px"}}>
-            <SectionHeader icon="🤖" title="Mesin Sintesis TAF 24H" sub="Sliding Window Cross-Validation + Dual-Model Blending" />
+            <SectionHeader icon="🧮" title="Mesin Sintesis TAF 24H" sub="Heuristik rule-based + rata-rata tertimbang dua model NWP (bukan model ML terlatih)" />
             <div style={{display:"flex",flexDirection:"column",gap:"7px"}}>
               {[
-                {n:"1",title:"Sliding Window + Cross-Validation",desc:"Partisi METAR 24H menjadi Training (H2: 12-24 jam lalu) dan Validation (H1: 0-12 jam lalu). Probabilitas dihitung dengan Laplace Smoothing (α=1) lalu divalidasi silang untuk mendeteksi concept drift siklus konveksi.",border:"#1E3A5F"},
-                {n:"2",title:"Dual-Model NWP (ECMWF IFS025 vs GFS Seamless)",desc:`2 request terpisah ke Open-Meteo API. Jika gap antar model ≤15% → rata-rata konsensus. Jika divergen → prioritas ECMWF (resolusi lebih tinggi 0.25°). Window waktu: 06-14Z = 14-22 WITA (peak konveksi Kaltim).`,border:nwpSummary?.consistent?"#166534":"#92400E"},
-                {n:"3",title:"Bayesian Blending (40% METAR + 60% NWP)",desc:"Bobot berdasarkan Glahn & Lowry (1972): NWP dominan untuk prakiraan 6-24 jam ke depan. METAR historis berkontribusi pada pola diurnal lokal yang model global sering miss.",border:"#1E4A7F"},
-                {n:"4",title:"ICAO Decision Rule → TAF Formatting",desc:"P≥50%→TEMPO | P 40-49%→PROB40 TEMPO | P 30-39%→PROB30 TEMPO | P<30%→tidak ada grup. Tanda '=' hanya di akhir TAF. Window konveksi disesuaikan pola diurnal Kaltim.",border:"#4A3A00"},
+                {n:"1",title:"Partisi Data METAR (dari file upload) + Aturan Penyesuaian",desc:"METAR diambil dari file yang diupload pengguna (bukan API live), lalu dibagi menjadi kelompok baru (0-12 jam) dan lama (12-24 jam). Frekuensi TS dihitung dengan Laplace Smoothing (α=1), lalu disesuaikan via aturan if/else tetap — ini heuristik, bukan cross-validation atau pembelajaran mesin.",border:"#1E3A5F"},
+                {n:"2",title:"Dual-Model NWP (ECMWF IFS025 vs GFS Seamless)",desc:"2 request terpisah ke Open-Meteo, difilter ke tanggal kalender target (bukan cuma jam-of-day) supaya data besok/lusa tidak tercampur. Nilai yang dipakai adalah peluang hujan umum — proxy kasar untuk peluang TS, bukan pengukuran langsung. Gap ≤15% → rata-rata; jika divergen → prioritas ECMWF.",border:nwpSummary?.consistent?"#166534":"#92400E"},
+                {n:"3",title:"Rata-rata Tertimbang (60% NWP + 40% METAR)",desc:"Bobot tetap yang dipilih sebagai heuristik operasional (terinspirasi gagasan umum blending MOS), BUKAN hasil kalibrasi Bayesian atau statistik formal.",border:"#1E4A7F"},
+                {n:"4",title:"Aturan ICAO → Format TAF",desc:"P≥50%→TEMPO | 40-49%→PROB40 TEMPO | 30-39%→PROB30 TEMPO | <30%→tidak ada grup. Isi grup (angin/vis/awan) sekarang diturunkan dari baseline aktual, bukan string statis. Tanda '=' hanya di akhir TAF.",border:"#4A3A00"},
               ].map(({n,title,desc,border})=>(
                 <div key={n} style={{background:"#080F1A",padding:"8px 10px",borderRadius:"6px",border:`1px solid ${border}`}}>
                   <div style={{fontSize:"10px",color:"#7DD3FC",fontWeight:"700",marginBottom:"2px"}}>{n}. {title}</div>
@@ -620,13 +739,26 @@ export default function TAFForecaster() {
             </div>
           </div>
 
-          <button onClick={generateTAF} disabled={generating} style={{background:generating?"#1A3A5F":"linear-gradient(135deg,#1E90FF,#0055CC)",border:"none",borderRadius:"8px",padding:"13px",fontSize:"12px",fontWeight:"700",color:generating?"#475569":"#fff",cursor:generating?"not-allowed":"pointer",letterSpacing:"0.06em",boxShadow:"0 4px 16px #1E90FF30"}}>
-            {generating?"⟳ Kalkulasi ML & NWP...":"✨ GENERATE TAF 24 JAM"}
+          <button
+            onClick={generateTAF}
+            disabled={generating || metarLoading || nwpLoading}
+            style={{
+              background: (generating || metarLoading || nwpLoading) ? "#1A3A5F" : "linear-gradient(135deg,#1E90FF,#0055CC)",
+              border:"none",borderRadius:"8px",padding:"13px",fontSize:"12px",fontWeight:"700",
+              color:(generating || metarLoading || nwpLoading) ? "#475569" : "#fff",
+              cursor:(generating || metarLoading || nwpLoading) ? "not-allowed" : "pointer",
+              letterSpacing:"0.06em",boxShadow:"0 4px 16px #1E90FF30"
+            }}
+          >
+            {generating ? "⟳ Menghitung heuristik & NWP..." : (metarLoading || nwpLoading) ? "⟳ Menunggu data METAR/NWP..." : "✨ GENERATE TAF 24 JAM"}
           </button>
+          {formError && (
+            <div style={{fontSize:"9px",color:"#FCA5A5",fontFamily:"monospace",marginTop:"-4px"}}>⚠ {formError}</div>
+          )}
 
           {reasoning && (
             <div style={{background:"#0E2A45",border:"1px solid #1E3A5F",borderRadius:"8px",padding:"12px",maxHeight:"280px",overflowY:"auto"}}>
-              <div style={{fontSize:"10px",color:"#7DD3FC",fontWeight:"700",marginBottom:"6px"}}>💡 ML TRACE & ANALISIS BLENDING</div>
+              <div style={{fontSize:"10px",color:"#7DD3FC",fontWeight:"700",marginBottom:"6px"}}>💡 TRACE PERHITUNGAN & ANALISIS BLENDING</div>
               <pre style={{fontSize:"9px",color:"#CBD5E1",lineHeight:"1.8",whiteSpace:"pre-wrap",margin:0,fontFamily:"monospace"}}>{reasoning}</pre>
             </div>
           )}
