@@ -233,7 +233,7 @@ export default function TAFForecaster() {
 
         {/* Output Column */}
         <div style={{ background: "#000D06", border: "1px solid #004D1A", padding: "15px", borderRadius: "8px" }}>
-          <h4 style={{ color: "#22C55E", marginTop: 0 }}>AFIS TERMINAL OUTPUT</h4>
+          <h4 style={{ color: "#22C55E", marginTop: 0 }}>MODEL TAF OUTPUT</h4>
           <pre style={{ color: "#22C55E", fontFamily: "monospace", fontSize: "11px", lineHeight: "1.8", whiteSpace: "pre-wrap" }}>
             {tafOutput || "Menunggu kalkulasi hybrid..."}
           </pre>
