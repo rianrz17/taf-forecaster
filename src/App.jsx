@@ -276,7 +276,7 @@ export default function TAFForecaster() {
 
         // ─── ICAO TAF FORMATTING (24 Hours) ───
         const header = `TAF ${station} ${issueDate}${issueTime}Z ${validFrom}/${validTo}`;
-        const lines = [`${header} ${baseline.wind} ${baseline.vis} ${baseline.cloudStr}`];
+        const lines = [`${header} ${baseline.wind} ${baseline.vis} ${baseline.cloud}`];
 
         if (pFinal >= 50) {
           lines.push(`  TEMPO ${validFrom.substring(0,2)}12/${validFrom.substring(0,2)}18 15012G22KT 4000 TSRA SCT015CB BKN070`);
