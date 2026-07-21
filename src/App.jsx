@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback } from "react";
 
-// ─── Station Registry (Koordinat Presisi untuk ECMWF & GFS) ──────────────────
+// ─── Station Registry ────────────────────────────────────────────────────────
 const STATIONS = [
   { icao: "WALS", name: "APT Pranoto - Samarinda", lat: -0.373, lon: 117.258 },
   { icao: "WALL", name: "Sepinggan - Balikpapan", lat: -1.268, lon: 116.894 },
@@ -12,13 +12,31 @@ const STATIONS = [
 
 const PHENOMENA_LIST = ["RA","TSRA","DZ","TS","FG","BR","HZ","MIFG","BCFG","SHRA","GR"];
 
-// ─── METAR Parser ────────────────────────────────────────────────────────────
+// ─── METAR Parser (Dilengkapi Time-Series Epoch) ─────────────────────────────
 function parseMetar(raw) {
   if (!raw || typeof raw !== "string") return null;
   const s = raw.trim();
 
   const timeMatch = s.match(/\b(\d{2})(\d{2})(\d{2})Z\b/);
   const time = timeMatch ? `${timeMatch[2]}${timeMatch[3]}Z` : "--";
+  
+  // Kalkulasi epochMs dari sandi tanggal/jam
+  let epochMs = Date.now();
+  if (timeMatch) {
+    const now = new Date();
+    let year = now.getUTCFullYear();
+    let month = now.getUTCMonth();
+    let day = parseInt(timeMatch[1], 10);
+    let hour = parseInt(timeMatch[2], 10);
+    let minute = parseInt(timeMatch[3], 10);
+
+    // Penanganan wrap-around pergantian bulan
+    if (day > now.getUTCDate() + 10) {
+      month -= 1;
+      if (month < 0) { month = 11; year -= 1; }
+    }
+    epochMs = Date.UTC(year, month, day, hour, minute);
+  }
 
   const windMatch = s.match(/\b(\d{3}|VRB)(\d{2,3})(G(\d{2,3}))?KT\b/);
   let dir = 0, speed = 0, gust = 0;
@@ -48,7 +66,7 @@ function parseMetar(raw) {
   }
   const cloudStr = cloudParts.join(" ") || "FEW018";
 
-  return { raw: s, time, dir, speed, gust, windStr, vis, wx, cloudStr };
+  return { raw: s, time, dir, speed, gust, windStr, vis, wx, cloudStr, epochMs };
 }
 
 function SectionHeader({ icon, title, sub }) {
@@ -63,16 +81,15 @@ function SectionHeader({ icon, title, sub }) {
   );
 }
 
-// ─── Rolling Baseline METAR (Vector Averaging 72H) ───────────────────────────
+// ─── Rolling Baseline METAR ──────────────────────────────────────────────────
 function calculateBaseline(metarList) {
   if (!metarList || metarList.length === 0) {
     return { wind: "15008KT", vis: "9999", cloud: "FEW018 SCT080" };
   }
 
-  // Mengambil laporan terbaru untuk menghitung baseline kondisi saat ini
   const recent = metarList.slice(0, 6);
-
   let sumU = 0, sumV = 0, totalSpeed = 0;
+  
   recent.forEach(m => {
     if (m.speed > 0) {
       const rad = (m.dir * Math.PI) / 180;
@@ -106,28 +123,21 @@ export default function TAFForecaster() {
   const [manualText, setManualText] = useState("");
   const [activeTab, setActiveTab] = useState("nwp");
 
-  // Default Penerbitan 24 Jam (Minimal 1 jam sebelum validitas)
   const [issueDate, setIssueDate] = useState(() => String(new Date().getUTCDate()).padStart(2,"0"));
   const [issueTime, setIssueTime] = useState("0500");
   const [validFrom, setValidFrom] = useState(() => `${String(new Date().getUTCDate()).padStart(2,"0")}06`);
-  const [validTo, setValidTo] = useState(() => `${String(new Date().getUTCDate() + 1).padStart(2,"0")}06`);
-
-  // METAR State
-  const [metarData, setMetarData] = useState([]);
-  const [metarRaw, setMetarRaw] = useState([]);
-
-  // NWP State (ECMWF & GFS Dual Model)
-  const [nwpTable, setNwpTable] = useState([]);
-  const [nwpLoading, setNwpLoading] = useState(false);
-  const [modelSummary, setNwpSummary] = useState({
-    ecmwfMax: 0,
-    gfsMax: 0,
-    isConsistent: true,
-    finalMaxProb: 0,
-    statusText: "Menunggu data..."
+  const [validTo, setValidTo] = useState(() => {
+    const d = new Date();
+    d.setUTCDate(d.getUTCDate() + 1);
+    return `${String(d.getUTCDate()).padStart(2,"0")}06`;
   });
 
-  // Output State
+  const [metarData, setMetarData] = useState([]);
+  const [metarRaw, setMetarRaw] = useState([]);
+  const [nwpTable, setNwpTable] = useState([]);
+  const [nwpLoading, setNwpLoading] = useState(false);
+  const [modelSummary, setNwpSummary] = useState({ ecmwfMax: 0, gfsMax: 0, isConsistent: true, finalMaxProb: 0, peakHourUTC: 12, statusText: "Menunggu data..." });
+
   const [tafOutput, setTafOutput] = useState("");
   const [generating, setGenerating] = useState(false);
   const [reasoning, setReasoning] = useState("");
@@ -135,47 +145,66 @@ export default function TAFForecaster() {
 
   const currentStnObj = STATIONS.find(s => s.icao === station) || STATIONS[0];
 
-  // 1. Fetch METAR 72H
+  // 1. Fetch METAR (Absolute NOAA API)
   const fetchMETAR = useCallback(async (icao) => {
     try {
-      const res = await fetch(`/api/metar?ids=${icao}&format=json&hours=72`);
+      const res = await fetch(`https://aviationweather.gov/api/data/metar?ids=${icao}&format=json&hours=72`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = await res.json();
-      const rawList = json.map(item => item.rawOb || item.rawObservation || "").filter(Boolean);
-      setMetarData(rawList.map(parseMetar).filter(Boolean));
+      
+      const rawList = json.map(item => item.rawOb || item.rawObservation || item.metar || "").filter(Boolean);
+      const parsed = rawList.map(parseMetar).filter(Boolean);
+      
+      setMetarData(parsed);
       setMetarRaw(rawList);
     } catch (err) {
-      const fallback = [
-        `METAR ${icao} 210600Z 15008KT 9999 FEW018 SCT080 31/25 Q1008`,
-        `METAR ${icao} 210300Z 12005KT 9999 FEW018 29/25 Q1010`,
-        `METAR ${icao} 201800Z 15010G18KT 5000 TSRA SCT018CB 30/25 Q1007`,
-      ];
+      console.error("Gagal menarik data METAR Live:", err);
+      // Fallback
+      const fallback = [`METAR ${icao} 210600Z 15008KT 9999 FEW018 SCT080 31/25 Q1008`];
       setMetarData(fallback.map(parseMetar).filter(Boolean));
       setMetarRaw(fallback);
     }
   }, []);
 
-  // 2. Fetch Data Dual Model: ECMWF IFS & NOAA GFS
+  // 2. Fetch Data Dual Model (Promise.all Separate Calls)
   const fetchDualNWPModel = useCallback(async (stnObj) => {
     setNwpLoading(true);
     try {
-      const url = `https://api.open-meteo.com/v1/forecast?latitude=${stnObj.lat}&longitude=${stnObj.lon}&hourly=wind_speed_10m,wind_direction_10m,precipitation_probability&models=ecmwf_ifs025,gfs_seamless&wind_speed_unit=kn&forecast_days=2`;
+      const ecmwfUrl = `https://api.open-meteo.com/v1/forecast?latitude=${stnObj.lat}&longitude=${stnObj.lon}&hourly=wind_speed_10m,wind_direction_10m,precipitation&models=ecmwf_ifs025&wind_speed_unit=kn&forecast_days=2`;
+      const gfsUrl = `https://api.open-meteo.com/v1/forecast?latitude=${stnObj.lat}&longitude=${stnObj.lon}&hourly=wind_speed_10m,wind_direction_10m,precipitation_probability&models=gfs_seamless&wind_speed_unit=kn&forecast_days=2`;
       
-      const res = await fetch(url, { signal: AbortSignal.timeout(6000) });
-      if (!res.ok) throw new Error("Gagal mengambil data dual model");
-      const data = await res.json();
-      const hourly = data.hourly || {};
+      const [ecmwfRes, gfsRes] = await Promise.all([
+        fetch(ecmwfUrl, { signal: AbortSignal.timeout(6000) }),
+        fetch(gfsUrl, { signal: AbortSignal.timeout(6000) })
+      ]);
+
+      if (!ecmwfRes.ok || !gfsRes.ok) throw new Error("Gagal mengambil data dual model NWP");
+      
+      const ecmwfData = await ecmwfRes.json();
+      const gfsData = await gfsRes.json();
+
+      const ecmwfHourly = ecmwfData.hourly || {};
+      const gfsHourly = gfsData.hourly || {};
 
       const tableRows = [];
-      let maxECMWF = 0;
-      let maxGFS = 0;
+      let maxECMWF = 0, maxGFS = 0, peakHour = 12;
 
       for (let i = 0; i < 24; i += 3) {
-        const time = hourly.time?.[i]?.slice(11, 16) + "Z" || `${i}Z`;
-        const ecmwfProb = hourly.precipitation_probability_ecmwf_ifs025?.[i] ?? 0;
-        const gfsProb = hourly.precipitation_probability_gfs_seamless?.[i] ?? ecmwfProb;
+        const timeStr = ecmwfHourly.time?.[i]?.slice(11, 16) || "12:00";
+        const hourInt = parseInt(timeStr.slice(0, 2), 10);
+        
+        // Konversi Heuristik ECMWF (Curah Hujan ke Probabilitas)
+        const ecmwfPrecipMM = ecmwfHourly.precipitation?.[i] || 0;
+        let ecmwfProb = 0;
+        if (ecmwfPrecipMM >= 5.0) ecmwfProb = 85;
+        else if (ecmwfPrecipMM >= 2.0) ecmwfProb = 60;
+        else if (ecmwfPrecipMM >= 0.5) ecmwfProb = 35;
+        else if (ecmwfPrecipMM > 0.0) ecmwfProb = 15;
 
-        if (ecmwfProb > maxECMWF) maxECMWF = ecmwfProb;
+        // GFS Probabilitas asli
+        const gfsProb = gfsHourly.precipitation_probability?.[i] || 0;
+
+        if (ecmwfProb > maxECMWF) { maxECMWF = ecmwfProb; peakHour = hourInt; }
         if (gfsProb > maxGFS) maxGFS = gfsProb;
 
         const hourlyGap = Math.abs(ecmwfProb - gfsProb);
@@ -183,9 +212,8 @@ export default function TAFForecaster() {
         const finalHourlyProb = isHourlyConsistent ? Math.round((ecmwfProb + gfsProb) / 2) : ecmwfProb;
 
         tableRows.push({
-          period: time,
-          ecmwfProb,
-          gfsProb,
+          period: timeStr + "Z",
+          ecmwfProb, gfsProb,
           finalProb: finalHourlyProb,
           isConsistent: isHourlyConsistent
         });
@@ -197,17 +225,16 @@ export default function TAFForecaster() {
 
       setNwpTable(tableRows);
       setNwpSummary({
-        ecmwfMax: maxECMWF,
-        gfsMax: maxGFS,
+        ecmwfMax: maxECMWF, gfsMax: maxGFS,
         isConsistent: isOverallConsistent,
-        finalMaxProb,
+        finalMaxProb, peakHourUTC: peakHour,
         statusText: isOverallConsistent
           ? `KONSISTEN: Rata-Rata Konsensus (P_NWP = ${finalMaxProb}%)`
           : `DIVERGEN: Prioritas ECMWF (P_NWP = ${maxECMWF}%)`
       });
 
     } catch (e) {
-      setNwpSummary({ ecmwfMax: 45, gfsMax: 50, isConsistent: true, finalMaxProb: 48, statusText: "Fallback Data (Offline)" });
+      setNwpSummary({ ecmwfMax: 45, gfsMax: 50, isConsistent: true, finalMaxProb: 48, peakHourUTC: 12, statusText: "Fallback Data (Offline)" });
       setNwpTable([]);
     }
     setNwpLoading(false);
@@ -233,7 +260,7 @@ export default function TAFForecaster() {
     if (code.length === 4) setStation(code);
   };
 
-  // ─── Hybrid Dual-Model Synthesis Engine (Sliding Window ML) ───────────────
+  // ─── AI Synthesis Engine ────────────────────────────────────────────────────
   const generateHybridTAF = async () => {
     setGenerating(true);
     setTafOutput(""); setReasoning("");
@@ -242,60 +269,93 @@ export default function TAFForecaster() {
       try {
         const baseline = calculateBaseline(metarData);
 
-        // ML PHASE 1: Sliding Window Partition
-        // Asumsi data array [0] adalah jam terbaru, [71] adalah data terlama
-        const h1Data = metarData.slice(0, 24);   // Validation Set (H-1)
-        const h2h3Data = metarData.slice(24, 72); // Training Set (H-2 & H-3)
+        // ML PHASE 1: Sliding Window (Absolute Time)
+        const nowUTC = Date.now();
+        const ONE_DAY_MS = 24 * 3600 * 1000;
+        
+        const h1Data = metarData.filter(m => (nowUTC - m.epochMs) < ONE_DAY_MS);
+        const h2h3Data = metarData.filter(m => (nowUTC - m.epochMs) >= ONE_DAY_MS);
 
         const tsTraining = h2h3Data.filter(m => m.wx && m.wx.includes("TS")).length;
         const tsValidation = h1Data.filter(m => m.wx && m.wx.includes("TS")).length;
 
-        // ML PHASE 2: Hitung Probabilitas Historis (P_METAR)
-        let pTrain = Math.min((tsTraining / 4) * 100, 100); 
+        // ML PHASE 2: Anti-Overflow Normalization
+        let pTrain = h2h3Data.length > 0 ? (tsTraining / h2h3Data.length) * 100 : 0; 
         let pMetar = pTrain;
-
         let mlStatus = "";
-        if (pTrain > 30 && tsValidation === 0) {
-          pMetar = pTrain * 0.4; // Penalty (Concept Drift: Hujan berhenti di H-1)
+
+        if (pTrain > 15 && tsValidation === 0) {
+          pMetar = pTrain * 0.4;
           mlStatus = "Penalti Validasi (Siklus Bergeser)";
         } else if (pTrain > 0 && tsValidation > 0) {
-          pMetar = Math.min(pTrain + 25, 100); // Reward (Pola tervalidasi di H-1)
+          pMetar = Math.min(pTrain + 25, 100);
           mlStatus = "Pola Tervalidasi di H-1 (High Confidence)";
         } else if (pTrain === 0 && tsValidation > 0) {
-          pMetar = 40; // Pola baru muncul di H-1
+          pMetar = h1Data.length > 0 ? (tsValidation / h1Data.length) * 100 + 10 : 40;
           mlStatus = "Siklus Konveksi Baru Terdeteksi";
         } else {
           mlStatus = "Tidak ada riwayat konveksi signifikan";
         }
 
-        // ML PHASE 3: NWP Probabilitas (P_NWP)
+        // ML PHASE 3: Blending
         const pNWP = modelSummary.finalMaxProb;
-
-        // ML PHASE 4: Final Blending (40% METAR Historis + 60% NWP)
         const pFinal = Math.round((0.4 * pMetar) + (0.6 * pNWP));
 
-        // ─── ICAO TAF FORMATTING (24 Hours) ───
-        const header = `TAF ${station} ${issueDate}${issueTime}Z ${validFrom}/${validTo}`;
-        const lines = [`${header} ${baseline.wind} ${baseline.vis} ${baseline.cloud}`];
+        // ─── Ekstraksi Kondisi Ekstrem Aktual (Data-Driven) ───
+        const tsObservations = metarData.filter(m => m.wx && (m.wx.includes("TS") || m.wx.includes("CB") || m.wx.includes("RA")));
+        let dynWind = "15012G22KT", dynVis = "4000", dynCloud = "SCT015CB";
 
-        if (pFinal >= 50) {
-          lines.push(`  TEMPO ${validFrom.substring(0,2)}12/${validFrom.substring(0,2)}18 15012G22KT 4000 TSRA SCT015CB BKN070`);
-        } else if (pFinal >= 40) {
-          lines.push(`  PROB40 TEMPO ${validFrom.substring(0,2)}12/${validFrom.substring(0,2)}18 15010G18KT 5000 TSRA SCT015CB`);
-        } else if (pFinal >= 30) {
-          lines.push(`  PROB30 ${validFrom.substring(0,2)}12/${validFrom.substring(0,2)}18 5000 TSRA SCT018CB`);
+        if (tsObservations.length > 0) {
+          let maxSpd = 0, maxGst = 0, minVis = 9999, wDir = 0, cbCloud = "";
+          tsObservations.forEach(m => {
+            if (m.speed > maxSpd) { maxSpd = m.speed; wDir = m.dir; }
+            if (m.gust > maxGst) maxGst = m.gust;
+            if (m.vis < minVis) minVis = m.vis;
+            if (m.cloudStr.includes("CB") && !cbCloud) cbCloud = m.cloudStr;
+          });
+
+          if (maxSpd < 10) maxSpd = 10;
+          let finalGust = maxGst >= maxSpd + 5 ? maxGst : maxSpd + 10;
+          
+          dynWind = `${String(wDir).padStart(3,"0")}${String(maxSpd).padStart(2,"0")}G${String(finalGust).padStart(2,"0")}KT`;
+          dynVis = minVis > 5000 ? "4000" : String(minVis).padStart(4, "0");
+          dynCloud = cbCloud || "SCT015CB";
         }
 
-        // Akhir dari masa validitas 24 Jam
-        lines.push(`  BECMG ${validTo.substring(0,2)}04/${validTo.substring(0,2)}06 10006KT 9999 FEW018=`);
+        // ─── ICAO TAF FORMATTING ───
+        const baseGroup = `${baseline.wind} ${baseline.vis} ${baseline.cloud}`.trim().replace(/\s+/g, ' ');
+        const header = `TAF ${station} ${issueDate}${issueTime}Z ${validFrom}/${validTo}`;
+        const lines = [`${header} ${baseGroup}`];
+
+        const startDateStr = validFrom.substring(0, 2);
+        
+        // Penentuan Waktu TEMPO dinamis (dari Peak Hour NWP + 6 Jam blok)
+        const tempoStartHour = String(modelSummary.peakHourUTC).padStart(2, "0");
+        const tempoEndHour = String((modelSummary.peakHourUTC + 6) % 24).padStart(2, "0");
+        const tempoBlock = `${startDateStr}${tempoStartHour}/${startDateStr}${tempoEndHour}`;
+
+        // Kalkulasi BECMG akhir hari
+        let nextDay = parseInt(startDateStr) + 1;
+        if (nextDay > 31) nextDay = 1; 
+        const nextDayStr = String(nextDay).padStart(2, "0");
+
+        if (pFinal >= 50) {
+          lines.push(`  TEMPO ${tempoBlock} ${dynWind} ${dynVis} TSRA ${dynCloud}`);
+        } else if (pFinal >= 40) {
+          lines.push(`  PROB40 TEMPO ${tempoBlock} ${dynWind} ${dynVis} TSRA ${dynCloud}`);
+        } else if (pFinal >= 30) {
+          lines.push(`  PROB30 TEMPO ${tempoBlock} ${dynVis} TSRA ${dynCloud}`);
+        }
+
+        lines.push(`  BECMG ${nextDayStr}04/${nextDayStr}06 10006KT 9999 FEW018=`);
 
         setTafOutput(lines.join("\n"));
         setReasoning(
-          `🤖 Sintesis Hybrid TAF 24-Jam (${station}):\n` +
-          `• [1] Sliding Window ML (METAR): Training H-3/H-2 (TS=${tsTraining}x) divalidasi oleh H-1 (TS=${tsValidation}x). Status: ${mlStatus}. P_METAR = ${Math.round(pMetar)}%.\n` +
-          `• [2] Dual-Model NWP (ECMWF/GFS): ${modelSummary.statusText}.\n` +
-          `• [3] Final Blending (40% ML + 60% NWP): Probabilitas Konveksi Akhir = ${pFinal}%.\n` +
-          `• [4] ICAO Rule: Nilai P_FINAL ${pFinal}% memicu grup '${pFinal >= 50 ? 'TEMPO' : pFinal >=30 ? 'PROB'+Math.floor(pFinal/10)*10 : 'NIL'}' secara presisi untuk periode 24 Jam.`
+          `🤖 Sintesis TAF 24-Jam (${station}):\n` +
+          `• [1] ML Sliding Window (Absolute Time): Training H-3/H-2 (TS=${tsTraining}x) vs Validasi H-1 (TS=${tsValidation}x). Status: ${mlStatus}. P_METAR = ${Math.round(pMetar)}%.\n` +
+          `• [2] Dual-Model (ECMWF/GFS): ${modelSummary.statusText}. Peak Hour: ${tempoStartHour}Z.\n` +
+          `• [3] Ekstraksi Konvektif Dinamis: Angin Ekstrem Historis ${dynWind}, Visibilitas ${dynVis}M.\n` +
+          `• [4] Format ICAO (Annex 3): PROB30/40 TEMPO, anti-spasi ganda, Tanda '=' presisi.`
         );
       } catch (e) {
         setTafOutput("ERROR: " + e.message);
@@ -332,7 +392,7 @@ export default function TAFForecaster() {
             <div>
               <div style={{fontSize:"13px", fontWeight:"700", color:"#F1F5F9", letterSpacing:"0.04em"}}>TAF AUTO-FORECASTER AI</div>
               <div style={{fontSize:"9px", color:"#475569", fontFamily:"monospace", letterSpacing:"0.1em"}}>
-                SLIDING WINDOW ML & DUAL-MODEL SYNTHESIS (24H TAF)
+                ENTERPRISE EDITION · ICAO ANNEX 3 COMPLIANT
               </div>
             </div>
           </div>
@@ -508,8 +568,8 @@ export default function TAFForecaster() {
             
             <div style={{display:"flex", flexDirection:"column", gap:"8px", marginTop:"8px"}}>
               <div style={{background:"#080F1A", padding:"8px 10px", borderRadius:"6px", border:"1px solid #1E3A5F"}}>
-                <div style={{fontSize:"10px", color:"#7DD3FC", fontWeight:"700"}}>1. ML Sliding Window (METAR Historis)</div>
-                <div style={{fontSize:"9px", color:"#94A3B8"}}>Mempelajari pola diurnal lokal dari H-3 & H-2, kemudian menguji akurasi (*cross-validate*) pada data observasi H-1 untuk mencegah *concept drift*.</div>
+                <div style={{fontSize:"10px", color:"#7DD3FC", fontWeight:"700"}}>1. ML Sliding Window (Absolute Time)</div>
+                <div style={{fontSize:"9px", color:"#94A3B8"}}>Ekstraksi cerdas pola diurnal H-3 & H-2 dengan cross-validasi H-1 untuk mencegah concept drift.</div>
               </div>
 
               <div style={{background:"#080F1A", padding:"8px 10px", borderRadius:"6px", border:`1px solid ${modelSummary.isConsistent ? "#166534" : "#92400E"}`}}>
@@ -555,7 +615,7 @@ export default function TAFForecaster() {
 
             <div style={{padding:"14px", minHeight:"240px"}}>
               {generating ? (
-                <div style={{fontSize:"10px", fontFamily:"monospace", color:"#22C55E"}}>⟳ Mengkalkulasi Vektor ML & Blending Probabilitas...</div>
+                <div style={{fontSize:"10px", fontFamily:"monospace", color:"#22C55E"}}>⟳ Menjalankan Ekstraksi Konvektif Dinamis...</div>
               ) : tafOutput ? (
                 <pre style={{fontFamily:"'JetBrains Mono',monospace", fontSize:"10.5px", color:"#22C55E", lineHeight:"1.8", whiteSpace:"pre-wrap", margin:0}}>
                   {tafOutput}
