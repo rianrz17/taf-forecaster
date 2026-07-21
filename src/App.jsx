@@ -289,7 +289,7 @@ export default function TAFForecaster() {
     return errors;
   };
 
-  // ── Algoritma Otomatis: METAR 24H + NWP Model + Satelit ───────────────────
+  // ── Algoritma Otomatis: METAR 24H + NWP Model + Satelit (Format Rapi) ─────
   const generateAutoTAF = async () => {
     setGenerating(true);
     setTafOutput(""); setReasoning(""); setAccuracy(null); setValidationErrors([]);
@@ -298,9 +298,9 @@ export default function TAFForecaster() {
       try {
         const latestMetar = metarData[0] || {};
         
-        // 1. Ekstrak Tren 24 Jam METAR
+        // 1. Ekstrak Tren METAR
         const hasHistoryTS = metarData.some(m => m.wx && m.wx.includes("TS"));
-        const baseWind = latestMetar.wind && latestMetar.wind !== "--" ? latestMetar.wind.replace("/", "") : "14008KT";
+        const baseWind = latestMetar.wind && latestMetar.wind !== "--" ? latestMetar.wind.replace("/", "") : "15008KT";
         const baseVis = latestMetar.vis && latestMetar.vis !== "----" ? latestMetar.vis : "9999";
         const baseCloud = latestMetar.cloud && latestMetar.cloud !== "--" ? latestMetar.cloud : "FEW018 SCT080";
 
@@ -308,24 +308,27 @@ export default function TAFForecaster() {
         const isHighConvection = SATELLITE_DATA.cbmIndex === "HIGH" || parseInt(SATELLITE_DATA.cloudTopTemp) < -40;
         const modelCBPeriod = MOCK_MODEL.find(m => m.cb);
 
-        // 3. Susun Bulletin TAF Otomatis (ICAO Annex 3)
+        // 3. Susun Bulletin TAF Rapi & Sesuai ICAO Annex 3
         const header = `TAF ${station} ${issueDate}${issueTime}Z ${validFrom}/${validTo}`;
-        let tafBody = `${header}\n      ${baseWind} ${baseVis} ${baseCloud}`;
+        const baseGroup = `${baseWind} ${baseVis} ${baseCloud}`.trim();
 
-        // Jika Satelit & NWP mendeteksi potensi pertumbuhan konvektif sore/malam
+        const lines = [`${header} ${baseGroup}`];
+
+        // Tambahkan TEMPO jika ada konveksi
         if (isHighConvection || modelCBPeriod) {
           const tempoTime = "0112/0118";
-          const tempoWind = modelCBPeriod ? ` ${modelCBPeriod.wind.replace("/", "")}` : " 16012G22KT";
-          const tempoVis = " 5000";
-          const tempoWx = " TSRA";
-          const tempoCloud = " SCT015CB BKN070";
+          const tempoWind = modelCBPeriod ? modelCBPeriod.wind.replace("/", "") : "15008G15KT";
+          const tempoVis = "5000";
+          const tempoWx = "TSRA";
+          const tempoCloud = "SCT015CB BKN070";
 
-          tafBody += `\n      TEMPO ${tempoTime}${tempoWind}${tempoVis}${tempoWx}${tempoCloud}`;
+          lines.push(`  TEMPO ${tempoTime} ${tempoWind} ${tempoVis} ${tempoWx} ${tempoCloud}`);
         }
 
-        // Tambahkan tren perbaikan cuaca (BECMG) di periode akhir
-        tafBody += `\n      BECMG 0122/0124 10006KT 9999 FEW018`;
+        // Tambahkan BECMG periode akhir + Tanda '=' ICAO
+        lines.push(`  BECMG 0122/0124 10006KT 9999 FEW018=`);
 
+        const tafBody = lines.join("\n");
         const errors = validateTAF(tafBody);
 
         setTafOutput(tafBody);
@@ -341,7 +344,7 @@ export default function TAFForecaster() {
         setTafOutput("ERROR: Gagal memproses data otomatis — " + e.message);
       }
       setGenerating(false);
-    }, 1200);
+    }, 1000);
   };
 
   const handleCopy = () => {
@@ -709,9 +712,10 @@ export default function TAFForecaster() {
               ) : tafOutput ? (
                 <pre style={{
                   fontFamily:"'JetBrains Mono','Courier New',monospace",
-                  fontSize:"12px", color:"#22C55E", lineHeight:"2",
+                  fontSize:"10.5px", color:"#22C55E", lineHeight:"1.8",
                   whiteSpace:"pre-wrap", margin:0,
-                  textShadow:"0 0 7px #22C55E30"
+                  textShadow:"0 0 7px #22C55E30",
+                  letterSpacing:"0.02em"
                 }}>
                   {tafOutput}<span style={{animation:"pulse 1s infinite", color:"#22C55E60"}}>█</span>
                 </pre>
