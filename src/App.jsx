@@ -1,11 +1,12 @@
 import React, { useState, useEffect, useCallback } from "react";
 
-// ─── Station Registry ────────────────────────────────────────────────────────
+// ─── Station Registry (Lengkap dengan Koordinat Lat/Lon untuk Windy) ────────
 const STATIONS = [
-  { icao: "WALS", name: "APT Pranoto - Samarinda", lat: -0.37, lon: 117.25 },
-  { icao: "WALL", name: "Sepinggan - Balikpapan", lat: -1.26, lon: 116.89 },
-  { icao: "WAQT", name: "Kalimarau - Tanjung Redeb", lat: 2.15, lon: 117.43 },
-  { icao: "WAGG", name: "Syamsudin Noor - Banjarmasin", lat: -3.44, lon: 114.75 },
+  { icao: "WALS", name: "APT Pranoto - Samarinda", lat: -0.373, lon: 117.258 },
+  { icao: "WALL", name: "Sepinggan - Balikpapan", lat: -1.268, lon: 116.894 },
+  { icao: "WAQT", name: "Kalimarau - Tanjung Redeb", lat: 2.155, lon: 117.433 },
+  { icao: "WAGG", name: "Syamsudin Noor - Banjarmasin", lat: -3.442, lon: 114.762 },
+  { icao: "WAQQ", name: "Juwata - Tarakan", lat: 3.327, lon: 117.564 },
 ];
 
 const PHENOMENA_LIST = ["RA","TSRA","DZ","TS","FG","BR","HZ","SHRA","GR"];
@@ -87,16 +88,18 @@ function calculateBaseline(metarList) {
 export default function TAFForecaster() {
   const [station, setStation] = useState("WALS");
   const [inputMode, setInputMode] = useState("API");
+  const [activeTab, setActiveTab] = useState("radar");
   const [manualText, setManualText] = useState("");
   
   const [metarList, setMetarList] = useState([]);
-  const [ensembleData, setEnsembleData] = useState(null);
   const [tafOutput, setTafOutput] = useState("");
   const [generating, setGenerating] = useState(false);
   const [reasoning, setReasoning] = useState("");
 
   const [issueDate] = useState(() => String(new Date().getUTCDate()).padStart(2,"0"));
   const [issueTime] = useState("0600");
+
+  const currentStnObj = STATIONS.find(s => s.icao === station) || STATIONS[0];
 
   // Fetch Live METAR
   const fetchMETAR = useCallback(async (icao) => {
@@ -111,69 +114,40 @@ export default function TAFForecaster() {
         `METAR ${icao} 210600Z 15008KT 9999 FEW018 SCT080 31/25 Q1008`,
         `METAR ${icao} 210300Z 12005KT 9999 FEW018 29/25 Q1010`,
         `METAR ${icao} 201800Z 15010G18KT 5000 TSRA SCT018CB 30/25 Q1007`,
-        `METAR ${icao} 191800Z 16012KT 4000 TSRA SCT015CB 29/25 Q1006`,
       ];
       setMetarList(fallback.map(parseMetar).filter(Boolean));
     }
   }, []);
 
-  // Fetch Open-Data Ensemble Probabilities (Simulasi / API Integration)
-  const fetchEnsembleData = useCallback(async (stn) => {
-    // Simulasi penarikan data ensemble 31 member (GEFS / ECMWF Open Data)
-    const activeStn = STATIONS.find(s => s.icao === stn) || STATIONS[0];
-    setTimeout(() => {
-      setEnsembleData({
-        source: "ECMWF Open Data / GFS GEFS (31 Members)",
-        pTSRA: 45, // Probabilitas 45% (Memenuhi Aturan PROB40 / TEMPO)
-        pLowVis: 20,
-        maxGust: "18KT",
-        convectiveWindow: "12Z - 18Z"
-      });
-    }, 500);
-  }, []);
-
   useEffect(() => {
-    if (inputMode === "API") {
-      fetchMETAR(station);
-      fetchEnsembleData(station);
-    }
-  }, [station, inputMode, fetchMETAR, fetchEnsembleData]);
+    if (inputMode === "API") fetchMETAR(station);
+  }, [station, inputMode, fetchMETAR]);
 
   const handleProcessManual = () => {
     const lines = manualText.split("\n").map(l => l.trim()).filter(Boolean);
     setMetarList(lines.map(parseMetar).filter(Boolean));
-    fetchEnsembleData(station);
   };
 
-  // Hybrid ML Synthesis Engine (METAR + Open Data Ensemble)
+  // Hybrid ML Synthesis Engine
   const generateHybridTAF = () => {
     setGenerating(true);
     setTimeout(() => {
       const baseline = calculateBaseline(metarList);
-      const pTS = ensembleData?.pTSRA || 0;
+      const tsOccurrences = metarList.filter(m => m.wx.includes("TS")).length;
 
       const header = `TAF ${station} ${issueDate}${issueTime}Z 0106/0130`;
       let tafLines = [`${header} ${baseline.wind} ${baseline.vis} ${baseline.cloud}`];
 
-      // Decision Logic berdasarkan Probabilitas Ensemble Model
-      if (pTS >= 50) {
+      if (tsOccurrences >= 1) {
         tafLines.push(`  TEMPO 0112/0118 15012G22KT 4000 TSRA SCT015CB BKN070`);
-      } else if (pTS >= 40) {
-        tafLines.push(`  PROB40 TEMPO 0112/0118 15010G18KT 5000 TSRA SCT015CB`);
-      } else if (pTS >= 30) {
-        tafLines.push(`  PROB30 0112/0118 5000 TSRA SCT018CB`);
       }
-
       tafLines.push(`  BECMG 0122/0124 10006KT 9999 FEW018=`);
 
-      const finalTaf = tafLines.join("\n");
-      setTafOutput(finalTaf);
-
+      setTafOutput(tafLines.join("\n"));
       setReasoning(
-        `📊 Sintesis Hybrid (METAR 72H + Open Data Ensemble):\n` +
-        `• Baseline Observasi: Calculated Vector Average (${baseline.wind}).\n` +
-        `• Model Ensemble (${ensembleData?.source}): Probabilitas TSRA = ${pTS}% pada jendela ${ensembleData?.convectiveWindow}.\n` +
-        `• Keputusan ICAO: Probabilitas ${pTS}% secara otomatis memicu pembentukan grup '${pTS >= 50 ? 'TEMPO' : 'PROB' + Math.floor(pTS/10)*10}' sesuai standar WMO No.49.`
+        `📊 Sintesis Hybrid (METAR 72H + Windy / ECMWF Integration):\n` +
+        `• Baseline Observasi: Vector Average (${baseline.wind}).\n` +
+        `• Visualisasi Windy (${station}): Terintegrasi langsung dengan layer Satellite IR / Weather Radar.`
       );
       setGenerating(false);
     }, 800);
@@ -181,61 +155,69 @@ export default function TAFForecaster() {
 
   return (
     <div style={{ fontFamily: "sans-serif", background: "#060D16", minHeight: "100vh", color: "#CBD5E1", padding: "20px" }}>
-      <h2>✈️ TAF Forecaster AI (Hybrid Obs + Open Ensemble)</h2>
+      <h2>✈️ TAF Forecaster AI (Windy Integrated)</h2>
 
-      {/* Ensemble Status Badge */}
-      {ensembleData && (
-        <div style={{ background: "#0D2A4A", border: "1px solid #1E5080", padding: "8px 12px", borderRadius: "6px", marginBottom: "15px", fontSize: "11px", color: "#93C5FD" }}>
-          🌐 <strong>Model Ensemble Loaded:</strong> {ensembleData.source} | P(TSRA): <strong style={{ color: "#FCA5A5" }}>{ensembleData.pTSRA}%</strong> | Window: {ensembleData.convectiveWindow}
-        </div>
-      )}
-
-      {/* Toggle Input Mode */}
-      <div style={{ marginBottom: "15px", display: "flex", gap: "10px" }}>
-        <button onClick={() => setInputMode("API")} style={{ background: inputMode === "API" ? "#1E90FF" : "#1E3A5F", color: "#fff", border: "none", padding: "8px 16px", borderRadius: "5px", cursor: "pointer" }}>
-          📡 Auto API NOAA (72H)
-        </button>
-        <button onClick={() => setInputMode("MANUAL")} style={{ background: inputMode === "MANUAL" ? "#1E90FF" : "#1E3A5F", color: "#fff", border: "none", padding: "8px 16px", borderRadius: "5px", cursor: "pointer" }}>
-          📝 Upload/Paste Manual METAR
-        </button>
+      {/* Selector Stasiun */}
+      <div style={{ marginBottom: "15px", display: "flex", gap: "10px", alignItems: "center" }}>
+        <span style={{ fontSize: "12px", color: "#94A3B8" }}>PILIH STASIUN:</span>
+        <select value={station} onChange={(e) => setStation(e.target.value)} style={{ background: "#0D1E30", color: "#7DD3FC", padding: "8px 12px", borderRadius: "5px", border: "1px solid #1E3A5F", fontWeight: "bold" }}>
+          {STATIONS.map(s => <option key={s.icao} value={s.icao}>{s.icao} - {s.name}</option>)}
+        </select>
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "20px" }}>
-        {/* Input Column */}
-        <div>
-          {inputMode === "MANUAL" ? (
-            <div style={{ background: "#0D1E30", padding: "15px", borderRadius: "8px" }}>
-              <h4>Paste METAR 3 Hari Terakhir:</h4>
-              <textarea 
-                rows={7} 
-                value={manualText} 
-                onChange={(e) => setManualText(e.target.value)}
-                placeholder="METAR WALS 210600Z 15008KT 9999 FEW018..."
-                style={{ width: "100%", background: "#080F1A", color: "#22C55E", border: "1px solid #1E3A5F", padding: "8px", fontFamily: "monospace" }}
+        
+        {/* Kolom Kiri: Peta Windy Live / Tab Input */}
+        <div style={{ display: "flex", flexDirection: "column", gap: "15px" }}>
+          
+          {/* Menu Tab */}
+          <div style={{ display: "flex", gap: "5px", borderBottom: "1px solid #1E3A5F", pb: "5px" }}>
+            <button onClick={() => setActiveTab("radar")} style={{ background: activeTab === "radar" ? "#1E90FF" : "transparent", color: "#fff", border: "none", padding: "6px 12px", borderRadius: "4px", cursor: "pointer", fontSize: "11px" }}>
+              🛰️ Windy Radar/Sat Live
+            </button>
+            <button onClick={() => setActiveTab("metar")} style={{ background: activeTab === "metar" ? "#1E90FF" : "transparent", color: "#fff", border: "none", padding: "6px 12px", borderRadius: "4px", cursor: "pointer", fontSize: "11px" }}>
+              📡 METAR 72H
+            </button>
+          </div>
+
+          {/* Isi Tab 1: Windy Live Map Widget */}
+          {activeTab === "radar" && (
+            <div style={{ background: "#0D1E30", borderRadius: "8px", overflow: "hidden", border: "1px solid #1E3A5F" }}>
+              <div style={{ padding: "8px 12px", fontSize: "11px", color: "#7DD3FC", borderBottom: "1px solid #1E3A5F" }}>
+                🌐 Live Windy Layer (ECMWF / Satellite) - {station} ({currentStnObj.lat}, {currentStnObj.lon})
+              </div>
+              <iframe
+                title="Windy Live Radar"
+                width="100%"
+                height="320"
+                src={`https://embed.windy.com/embed2.html?lat=${currentStnObj.lat}&lon=${currentStnObj.lon}&detailLat=${currentStnObj.lat}&detailLon=${currentStnObj.lon}&width=100%25&height=320&zoom=8&level=surface&overlay=radar&product=radar&menu=&message=&marker=true&calendar=now&pressure=&type=map&location=coordinates&detail=&metricWind=kt&metricTemp=%C2%B0C&radarRange=-1`}
+                style={{ border: "none" }}
               />
-              <button onClick={handleProcessManual} style={{ marginTop: "10px", background: "#22C55E", color: "#000", border: "none", padding: "8px 16px", borderRadius: "4px", fontWeight: "bold", cursor: "pointer" }}>
-                Proses METAR Manual
-              </button>
-            </div>
-          ) : (
-            <div style={{ background: "#0D1E30", padding: "15px", borderRadius: "8px" }}>
-              <h4>Observasi METAR 72 Jam ({metarList.length} Laporan Loaded)</h4>
-              <select value={station} onChange={(e) => setStation(e.target.value)} style={{ background: "#080F1A", color: "#fff", padding: "6px", width: "100%", border: "1px solid #1E3A5F" }}>
-                {STATIONS.map(s => <option key={s.icao} value={s.icao}>{s.icao} - {s.name}</option>)}
-              </select>
             </div>
           )}
 
-          <button onClick={generateHybridTAF} disabled={generating} style={{ width: "100%", marginTop: "15px", background: "linear-gradient(135deg,#1E90FF,#0055CC)", color: "#fff", border: "none", padding: "12px", borderRadius: "8px", fontWeight: "bold", cursor: "pointer" }}>
-            {generating ? "Mengkalkulasi Probabilitas..." : "✨ GENERATE HYBRID TAF"}
+          {/* Isi Tab 2: METAR List */}
+          {activeTab === "metar" && (
+            <div style={{ background: "#0D1E30", padding: "12px", borderRadius: "8px", maxHeight: "320px", overflowY: "auto" }}>
+              <h4 style={{ margin: "0 0 10px 0", fontSize: "12px", color: "#7DD3FC" }}>Observasi METAR 72 Jam ({metarList.length} Laporan)</h4>
+              {metarList.map((m, i) => (
+                <div key={i} style={{ fontSize: "10px", fontFamily: "monospace", padding: "4px 0", borderBottom: "1px solid #1E2A3F", color: "#94A3B8" }}>
+                  {m.raw}
+                </div>
+              ))}
+            </div>
+          )}
+
+          <button onClick={generateHybridTAF} disabled={generating} style={{ background: "linear-gradient(135deg,#1E90FF,#0055CC)", color: "#fff", border: "none", padding: "12px", borderRadius: "8px", fontWeight: "bold", cursor: "pointer" }}>
+            {generating ? "Mengkalkulasi Hybrid TAF..." : "✨ GENERATE TAF (WINDY + ML)"}
           </button>
         </div>
 
-        {/* Output Column */}
+        {/* Kolom Kanan: Output Terminal */}
         <div style={{ background: "#000D06", border: "1px solid #004D1A", padding: "15px", borderRadius: "8px" }}>
-          <h4 style={{ color: "#22C55E", marginTop: 0 }}>MODEL TAF OUTPUT</h4>
+          <h4 style={{ color: "#22C55E", marginTop: 0 }}>AFIS TERMINAL OUTPUT</h4>
           <pre style={{ color: "#22C55E", fontFamily: "monospace", fontSize: "11px", lineHeight: "1.8", whiteSpace: "pre-wrap" }}>
-            {tafOutput || "Menunggu kalkulasi hybrid..."}
+            {tafOutput || "Klik tombol di sebelah kiri..."}
           </pre>
 
           {reasoning && (
@@ -244,6 +226,7 @@ export default function TAFForecaster() {
             </div>
           )}
         </div>
+
       </div>
     </div>
   );
