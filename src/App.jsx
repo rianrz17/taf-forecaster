@@ -69,8 +69,13 @@ function vectorMeanWind(metarList) {
     su += m.speed * Math.sin(rad);
     sv += m.speed * Math.cos(rad);
   });
-  const n    = valid.length;
-  const dir  = Math.round((Math.atan2(su/n, sv/n) * 180 / Math.PI + 360) % 360);
+  const n      = valid.length;
+  const dirRaw = (Math.atan2(su/n, sv/n) * 180 / Math.PI + 360) % 360;
+
+  // ICAO Annex 3 §1.1.5: arah angin di TAF dibulatkan ke kelipatan 10 derajat
+  // Contoh: 142 deg -> 140 deg, 356 deg -> 360 deg, 4 deg -> 360 deg (bukan 0)
+  const dirRounded = Math.round(dirRaw / 10) * 10;
+  const dir  = dirRounded === 0 ? 360 : dirRounded > 360 ? dirRounded - 360 : dirRounded;
   const spd  = Math.round(Math.sqrt((su/n)**2 + (sv/n)**2));
   return { dir, speed: spd };
 }
@@ -415,28 +420,58 @@ export default function TAFForecaster() {
         const pFinal  = Math.round(W_NWP * pNWP + W_METAR * pMetarPct);
         trace.push(`• FASE 4 - Bayesian Blending: (${W_NWP}×${pNWP} + ${W_METAR}×${pMetarPct}) = P_FINAL ${pFinal}%`);
 
-        // ── FASE 5: ICAO Decision Rule ────────────────────────────────────────
-        //   p ≥ 50% → TEMPO (pasti, durasi ≥30 mnt atau berulang)
+        // ── FASE 5: Hitung TS Wind dari observasi METAR ──────────────────────
+        // Ambil laporan METAR yang mengandung fenomena TS untuk wind reference
+        // Jika tidak ada, fallback ke baseline wind + estimasi konvektif
+        const tsObs = metarData.filter(m => m.wx && m.wx.includes("TS") && m.speed > 0);
+        let tsDir, tsSpd, tsGust;
+
+        if (tsObs.length > 0) {
+          // Vektor rata-rata dari obs TS → sudah rounded 10° oleh vectorMeanWind
+          const tsVec = vectorMeanWind(tsObs);
+          tsDir  = tsVec.dir;
+          tsSpd  = Math.max(tsVec.speed, 8);  // minimal 8KT saat TS
+
+          // Gust: ambil nilai gust tertinggi dari obs TS, atau estimasi +10KT
+          const maxGust = Math.max(...tsObs.map(m => m.gust > 0 ? m.gust : m.speed + 10));
+          tsGust = Math.max(maxGust, tsSpd + 8);  // gust minimal 8KT di atas mean
+        } else {
+          // Fallback: gunakan arah baseline, naikkan kecepatan untuk konveksi
+          const base = vectorMeanWind(metarData);
+          tsDir  = base.dir;   // sudah rounded 10° dari vectorMeanWind
+          tsSpd  = Math.max(base.speed + 4, 10);
+          tsGust = tsSpd + 10;
+        }
+
+        // Format string angin TEMPO — arah sudah rounded 10° dari vectorMeanWind
+        const tsDirStr  = String(tsDir).padStart(3, "0");
+        const tsSpdStr  = String(tsSpd).padStart(2, "0");
+        const tsGustStr = String(tsGust).padStart(2, "0");
+        const tsWindStr = `${tsDirStr}${tsSpdStr}G${tsGustStr}KT`;
+
+        trace.push(`• FASE 5a - TS Wind: ${tsObs.length > 0 ? `dari ${tsObs.length} obs TS` : "fallback baseline"} → ${tsWindStr}`);
+
+        // ── FASE 5b: ICAO Decision Rule → pilih grup perubahan ───────────────
+        //   p ≥ 50% → TEMPO
         //   40-49% → PROB40 TEMPO
-        //   30-39% → PROB30 TEMPO (FIX #4: harus PROB30 TEMPO bukan PROB30 sendiri)
+        //   30-39% → PROB30 TEMPO (ICAO: PROB wajib dikombinasikan dengan TEMPO)
         //   < 30%  → tidak dicantumkan
         const convWindow = getConvectionWindow(validFrom);
         let changeGroup = "";
         let icaoRule = "";
         if (pFinal >= 50) {
-          changeGroup = `TEMPO ${convWindow.start}/${convWindow.end} 15012G22KT 4000 TSRA SCT015CB BKN070`;
-          icaoRule = `P_FINAL=${pFinal}% ≥ 50% → TEMPO`;
+          changeGroup = `TEMPO ${convWindow.start}/${convWindow.end} ${tsWindStr} 4000 TSRA SCT015CB BKN070`;
+          icaoRule = `P_FINAL=${pFinal}% >= 50% → TEMPO`;
         } else if (pFinal >= 40) {
-          changeGroup = `PROB40 TEMPO ${convWindow.start}/${convWindow.end} 15010G18KT 5000 TSRA SCT015CB`;
+          changeGroup = `PROB40 TEMPO ${convWindow.start}/${convWindow.end} ${tsWindStr} 5000 TSRA SCT015CB`;
           icaoRule = `P_FINAL=${pFinal}% 40-49% → PROB40 TEMPO`;
         } else if (pFinal >= 30) {
-          // FIX #4: PROB30 TEMPO (bukan PROB30 saja)
-          changeGroup = `PROB30 TEMPO ${convWindow.start}/${convWindow.end} 5000 TSRA SCT018CB`;
+          changeGroup = `PROB30 TEMPO ${convWindow.start}/${convWindow.end} ${tsWindStr} 5000 TSRA SCT018CB`;
           icaoRule = `P_FINAL=${pFinal}% 30-39% → PROB30 TEMPO`;
         } else {
           icaoRule = `P_FINAL=${pFinal}% < 30% → Tidak ada grup perubahan konveksi`;
         }
-        trace.push(`• FASE 5 - ICAO Rule: ${icaoRule}`);
+        trace.push(`• FASE 5b - ICAO Rule: ${icaoRule}`);
 
         // ── FASE 6: Bangun string TAF dengan validasi ICAO ────────────────────
         const baseline    = calculateBaseline(metarData);
